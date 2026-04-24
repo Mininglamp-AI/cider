@@ -15,19 +15,19 @@ import mlx.nn as nn
 from PIL import Image
 from pathlib import Path
 ROOT_DIR = str(Path(__file__).parent.parent)
-sys.path.insert(0, str(ROOT_DIR))
-sys.path.append(str(ROOT_DIR / Path("vlm_service")))
-from replay_prompt import build_prompt_at_step
+sys.path.insert(0, ROOT_DIR)
+
+from session_data.replay_prompt import build_prompt_at_step
 from vlm_service.custom_qwen3vl import custom_stream_generate
 from mlx_vlm.utils import load as vlm_load
 
 FP16_MODEL  = '/Users/ws/Downloads/sft_baseline_v2'
 W8A16_MODEL = '/Users/ws/Downloads/sft_baseline_v2_w8a16'
-SESSION_DIR = str(ROOT_DIR / Path("session_data"))
+SESSION_DIR = os.path.join(ROOT_DIR, "session_data")
 STEPS       = [0, 1, 2]  # step 0: 1img, step 1: 2imgs, step 2: 3imgs
 MAX_TOKENS  = 200
 PREFILL_STEP = 512
-N_SPEED_RUNS = 3  # per-step speed runs (fewer since we have multiple steps)
+N_SPEED_RUNS = 2  # per-step speed runs (fewer since we have multiple steps)
 
 
 def load_step(session_dir, step):
@@ -68,7 +68,7 @@ def run_generate(model, processor, messages, pil_images, use_split=False):
     mx.reset_peak_memory()
 
     if use_split:
-        from ane_split.split_linear import SplitLinear
+        from experimental.split_linear import SplitLinear
         SplitLinear.set_prefill(True)
 
     text = ""
@@ -88,7 +88,7 @@ def run_generate(model, processor, messages, pil_images, use_split=False):
         verbose=False,
     ):
         if first_token and use_split:
-            from ane_split.split_linear import SplitLinear
+            from experimental.split_linear import SplitLinear
             SplitLinear.set_prefill(False)
             first_token = False
         text += resp.text
@@ -98,7 +98,7 @@ def run_generate(model, processor, messages, pil_images, use_split=False):
         gen_tokens = resp.generation_tokens
 
     if use_split:
-        from ane_split.split_linear import SplitLinear
+        from experimental.split_linear import SplitLinear
         SplitLinear.set_prefill(False)
 
     total_time = prefill_time + (gen_tokens / decode_tps if decode_tps > 0 else 0)
@@ -151,7 +151,7 @@ def main():
     configs = [
         ('fp16',       FP16_MODEL,  False, "GPU FP16"),
         ('w8a16',      W8A16_MODEL, False, "GPU W8A16"),
-        ('w8a16_split', FP16_MODEL, True,  "W8A16+Split"),
+        ('w8a8', W8A16_MODEL, False,  "GPU W8A8"),
     ]
 
     all_results = {}  # config_key -> {step -> {text, action, coords, timings[]}}
@@ -167,7 +167,7 @@ def main():
 
         # Patch if split
         if use_split:
-            from ane_split.split_linear import patch_model
+            from experimental.split_linear import patch_model
             bridge = patch_model(model, PREFILL_STEP, verbose=True)
 
         cfg_results = {}

@@ -1,15 +1,15 @@
 # ANE Split — ANE+GPU Tensor Parallelism for Prefill Acceleration
 
-Split each linear layer's GEMM along output channels: **ANE computes ~65%** while **GPU computes ~35%**, running concurrently. This exploits the idle Apple Neural Engine during LLM inference to speed up prefill without any accuracy loss.
+Split each linear layer's GEMM along output channels: **ANE** and  **GPU** computes running concurrently. This exploits the idle Apple Neural Engine during LLM inference to try to speed up prefill without any accuracy loss.
 
 > **Platform:** Apple M4 (tested). M5 ANE API changes may cause failures — not yet validated.
 
 ## How It Works
 
 ```
-Input x ──┬── ANE (65% output channels, FP32, private API) ──┐
+Input x ──┬── ANE (r output channels, FP32, private API) ──┐
            │                                                    ├── concat → output
-           └── GPU (35% output channels, FP16, MLX matmul)  ──┘
+           └── GPU (1 - r output channels, FP16, MLX matmul)  ──┘
 ```
 
 1. **SplitLinear** wraps each `nn.Linear` / `nn.QuantizedLinear`
@@ -28,26 +28,14 @@ Input x ──┬── ANE (65% output channels, FP32, private API) ──┐
 
 ## Performance (Apple M4, Qwen3-VL-2B)
 
-| seq | FP16 GPU | W8A16 GPU | SplitLinear | Speedup vs FP16 | Speedup vs W8A16 |
-|-----|----------|-----------|-------------|------------------|-------------------|
-| 256 | 321.8 ms | 318.5 ms | **299.7 ms** | **1.07×** | **1.06×** |
-| 512 | 649.1 ms | 641.2 ms | **552.2 ms** | **1.18×** | **1.16×** |
-| 1024 | 1324.0 ms | 1348.6 ms | **1156.9 ms** | **1.14×** | **1.17×** |
+| seq | W8A16 GPU | SplitLinear | Speedup vs W8A16 |
+|-----|----------|-----------|-------------|
+| 512 | 639.9 ms | **615.9 ms** | **1.039×** |
+| 1024 | 1348.6 ms | **1156.9 ms** | **1.17×** |
 
 - Accuracy: cos ≈ 1.0, top-1 match = 100%
 - 168 layers split (28 layers × 6 projections), 28 GPU-only (down_proj)
 
-## Files
-
-```
-ane_split/
-├── split_linear.py          # SplitLinear + ANEBridge + patch_model()
-├── bench.py                 # End-to-end benchmark (W8A16 vs SplitLinear)
-├── libane_bridge_v6.m       # ANE private API bridge (Objective-C source)
-├── libane_bridge_v6.dylib   # Pre-built ANE bridge (arm64, macOS)
-├── ane_transpose_bench.c    # vDSP transpose microbenchmark
-└── README.md
-```
 
 ## Quick Start
 
@@ -82,7 +70,7 @@ MODEL_PATH=/path/to/model python3 bench.py 512
 
 ## Building the ANE Bridge
 
-The pre-built `libane_bridge_v6.dylib` is included. To rebuild from source:
+To build libane_bridge_v6.dylib from the source:
 
 ```bash
 clang -shared -O2 -framework Foundation -framework CoreML \
@@ -98,7 +86,7 @@ clang -shared -O2 -framework Foundation -framework CoreML \
 - **FP32 on ANE** — ANE operates in FP32 (no INT8/FP16 GEMM); benefit comes from parallelism, not precision
 - **Memory overhead** — ANE models consume additional system memory (~200MB for 2B model)
 - **No decode benefit** — Decode is single-token, falls back to GPU (no split overhead)
-
+- **No E2E benefit** - MLX natively employs lazy evaluation to reduce synchronization overhead. In end-to-end testing, our hybrid approach currently shows no advantage because we haven't yet implemented it with MLX's lazy evaluation.
 ## License
 
 MIT
