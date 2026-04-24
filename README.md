@@ -174,10 +174,10 @@ Auto-selected based on M. L2 cache swizzle dispatch included.
 ## Roadmap
 
 - [ ] Group quantization for W8A8/W4A8
-- [ ] Upstream to MLX as native op
 - [ ] PyTorch tensor binding via pybind11
 - [ ] Fused QKV + gate/up projection layers
 - [ ] Decode path optimization (hybrid W4A16 decode + W8A8 prefill)
+- [ ] mlx_vlm and mlx_lm examples
 
 ## Authors
 
