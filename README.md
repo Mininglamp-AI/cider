@@ -116,6 +116,12 @@ cider/
 |   ├── how_to_write_efficient_int_gemm_m5_zh.md
 ├── examples/
 │   └── basic_usage.py
+├── ane_split/             # ANE+GPU tensor parallelism (M4)
+│   ├── split_linear.py       # SplitLinear + ANEBridge + patch_model()
+│   ├── bench.py              # End-to-end benchmark
+│   ├── libane_bridge_v6.m    # ANE private API bridge (Obj-C source)
+│   ├── libane_bridge_v6.dylib
+│   └── README.md
 ├── CMakeLists.txt
 ├── pyproject.toml
 ├── setup.py
@@ -153,6 +159,39 @@ The INT8 GEMM uses Apple's `mpp::tensor_ops::matmul2d(16, 32, 16)` — hardware-
 | Small  | 32  | 128 | 512 | 32 | 128 | M ≤ 64 |
 
 Auto-selected based on M. L2 cache swizzle dispatch included.
+
+## ANE Split — ANE+GPU Tensor Parallelism (M4)
+
+In addition to INT8 TensorOps on M5, Cider includes an **ANE+GPU tensor-parallel prefill** path targeting **Apple M4** (and earlier chips with ANE).
+
+During LLM prefill, the GPU's matrix units are fully occupied — but the **Apple Neural Engine sits completely idle**. ANE Split exploits this by splitting each linear layer's GEMM along output channels:
+
+- **ANE** computes ~65% of output channels (FP32, via reverse-engineered private `_ANEClient` API)
+- **GPU** computes the remaining ~35% (FP16, standard MLX matmul)
+- Both run **concurrently**, and results are concatenated
+
+This is a form of **heterogeneous tensor parallelism** — not data parallelism, not pipeline parallelism — exploiting two distinct compute units on the same SoC.
+
+### Performance (Apple M4, Qwen3-VL-2B Prefill)
+
+| seq | FP16 GPU | W8A16 GPU | ANE Split | Speedup vs FP16 | Speedup vs W8A16 |
+|-----|----------|-----------|-----------|------------------|-------------------|
+| 256 | 321.8 ms | 318.5 ms | **299.7 ms** | **1.07×** | **1.06×** |
+| 512 | 649.1 ms | 641.2 ms | **552.2 ms** | **1.18×** | **1.16×** |
+| 1024 | 1324.0 ms | 1348.6 ms | **1156.9 ms** | **1.14×** | **1.17×** |
+
+Accuracy: cos ≈ 1.0, top-1 match = 100%.
+
+### Key Design Choices
+
+- **Prefill only**: Decode falls back to original GPU linear (zero overhead)
+- **Shared input preparation**: Q/K/V and Gate/Up projections share a single input transpose+numpy copy via `_InputGroup`
+- **Auto-routing**: Down projections (IC > 2×OC) stay GPU-only where ANE is inefficient
+- **Short-seq bypass**: Sequences < 192 tokens skip splitting (overhead > benefit)
+
+See [`ane_split/README.md`](ane_split/README.md) for full documentation, usage, and build instructions.
+
+> **Note:** ANE Split is tested on M4. M5 introduced ANE architecture changes that may break the private API bridge — not yet validated on M5.
 
 ## Quantization
 
@@ -207,3 +246,4 @@ MIT
 
 - [MLX](https://github.com/ml-explore/mlx) by Apple — primitive API, NAXFrag kernel architecture
 - Metal 4 MetalPerformancePrimitives for INT8 TensorOps
+- [maderix/ANE](https://github.com/maderix/ANE) — pioneering reverse-engineering of Apple Neural Engine private APIs, which inspired and informed our ANE+GPU tensor-parallel implementation
