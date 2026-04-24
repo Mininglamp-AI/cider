@@ -197,10 +197,21 @@ class SplitLinear:
         # GPU weight for split path
         self._is_quantized = isinstance(layer, nn.QuantizedLinear)
         if self._is_quantized:
-            w_gpu_np = w_np[self.ane_oc:, :]
-            self._w_gpu = mx.array(w_gpu_np).astype(mx.float16)
-            mx.eval(self._w_gpu)
+            # Re-quantize GPU portion as QuantizedLinear → native quantized_matmul
+            w_gpu_fp32 = mx.array(w_np[self.ane_oc:, :])  # [gpu_oc, ic] float32
+            w_q, scales, biases = mx.quantize(w_gpu_fp32,
+                                              group_size=layer.group_size,
+                                              bits=layer.bits)
+            self._gpu_layer = nn.QuantizedLinear(
+                ic, self.gpu_oc, bias=False,
+                group_size=layer.group_size, bits=layer.bits)
+            self._gpu_layer.weight = w_q
+            self._gpu_layer.scales = scales
+            self._gpu_layer.biases = biases
+            mx.eval(self._gpu_layer.parameters())
+            self._w_gpu = None  # not used for quantized path
         else:
+            self._gpu_layer = None
             self._w_gpu = None
 
         if input_group is not None:
@@ -236,11 +247,14 @@ class SplitLinear:
         fut = _ane_pool.submit(self.ane.run_rowmajor, self.h_ane, inp_np, L, out_buf)
 
         # GPU: matmul with GPU portion weight
-        if self._w_gpu is not None:
-            w_gpu = self._w_gpu
+        if self._gpu_layer is not None:
+            # Quantized: use native quantized_matmul via QuantizedLinear
+            gpu_out = self._gpu_layer(x_2d)
+        elif self._w_gpu is not None:
+            gpu_out = x_2d @ self._w_gpu.T
         else:
             w_gpu = self._orig.weight[self.ane_oc:, :]
-        gpu_out = x_2d @ w_gpu.T
+            gpu_out = x_2d @ w_gpu.T
         mx.eval(gpu_out)  # sync GPU — enables concurrent ANE execution
 
         # Wait for ANE

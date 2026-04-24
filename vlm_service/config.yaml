@@ -1,0 +1,17 @@
+# 模型配置
+model_name_or_path: /Users/ws/Downloads/weights/mlx/Qwen3-VL-2B-Instruct-8bit
+
+# 采样参数
+sampling:
+  temperature: 1.0
+  top_k: null
+  top_p: 1.0
+  repetition_penalty: 1.0
+  max_new_tokens: 1024
+
+# 服务配置
+server:
+  host: "0.0.0.0"
+  port: 8341
+  max_image_buffer_size: 2
+  ttl: 1800
