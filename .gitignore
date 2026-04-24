@@ -1,0 +1,25 @@
+# Build
+build/
+dist/
+*.egg-info/
+mlx_wxa8/lib/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# C++ / CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.o
+*.so
+*.dylib
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store

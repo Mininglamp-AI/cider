@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel", "nanobind>=2.12", "mlx>=0.31", "cmake"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cider"
+version = "0.6.0"
+description = "INT8 TensorOps quantized matmul for Apple M5+ (W8A8, W4A8)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+authors = [
+    {name = "Wang Shuo"},
+]
+dependencies = [
+    "mlx>=0.31",
+    "numpy",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/Mininglamp-AI/cider"
+
+[tool.setuptools.packages.find]
+include = ["cider*"]
+
+[tool.setuptools.package-data]
+"cider" = ["kernels/*.metal", "lib/*.so", "lib/*.dylib"]
