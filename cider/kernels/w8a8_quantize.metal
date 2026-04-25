@@ -61,7 +61,7 @@ quantize_per_token(const device half *X [[buffer(0)]], // [M, K] FP16 input
     row_max = simd_max(row_max);
 
     // Compute and broadcast scale
-    float s = row_max / 255.0f;
+    float s = row_max / 127.0f;
     if (s == 0.0f) {
       s = 1.0f;
     }

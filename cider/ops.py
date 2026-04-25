@@ -82,7 +82,7 @@ def quantize_weight_int8(
     """
     w = w.astype(np.float32)
     col_max = np.max(np.abs(w), axis=0)  # [N]
-    scale = col_max / 255.0
+    scale = col_max / 127.0
     scale = np.where(scale == 0, 1.0, scale)
     w_int8 = np.clip(np.round(w / scale[np.newaxis, :]), -128, 127).astype(np.int8)
     return w_int8, scale.astype(np.float32)
@@ -130,17 +130,22 @@ def w8a8_linear(
     mx.eval() is called, integrating with MLX's computation graph.
 
     Args:
-        x: Input activations [M, K] float16.
+        x: Input activations [M, K] float16 or bfloat16.
         w: INT8 weights [K, N] int8 (per-column quantized).
         scale_w: Per-column weight scales [N] float32.
         stream: Optional MLX stream for scheduling.
 
     Returns:
-        Output [M, N] float16.
+        Output [M, N] matching input dtype (float16 or bfloat16).
     """
     ext = _load_ext()
+    out_dtype = x.dtype
     kw = {"stream": stream} if stream is not None else {}
-    return ext.w8a8_linear(x, w, scale_w, kernel_dir(), **kw)
+    result = ext.w8a8_linear(x, w, scale_w, kernel_dir(), **kw)
+    # Kernel outputs float16; cast to input dtype if needed (lazy, near-zero cost)
+    if out_dtype != mx.float16:
+        result = result.astype(out_dtype, **kw)
+    return result
 
 
 def w4a8_linear(
@@ -168,8 +173,12 @@ def w4a8_linear(
         Output [M, N] float16.
     """
     ext = _load_ext()
+    out_dtype = x.dtype
     kw = {"stream": stream} if stream is not None else {}
-    return ext.w4a8_linear(x, packed_w, scale_w, kernel_dir(), **kw)
+    result = ext.w4a8_linear(x, packed_w, scale_w, kernel_dir(), **kw)
+    if out_dtype != mx.float16:
+        result = result.astype(out_dtype, **kw)
+    return result
 
 
 def int8_matmul_int32(

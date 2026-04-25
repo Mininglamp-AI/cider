@@ -3,7 +3,7 @@
 End-to-end benchmark on REAL trajectory data:
   1. GPU FP16 baseline
   2. GPU W8A16 (native quantized_matmul)
-  3. W8A16 + SplitLinear (ANE+GPU hybrid)
+  3. GPU W8A8 (INT8 TensorOps via cider fused_hybrid, prefill only)
 
 Uses replay_prompt.build_prompt_at_step() to build real prompts with real screenshots.
 Compares both accuracy (action output) and speed (prefill + decode).
@@ -16,6 +16,7 @@ from PIL import Image
 from pathlib import Path
 ROOT_DIR = str(Path(__file__).parent.parent)
 sys.path.insert(0, ROOT_DIR)
+sys.path.insert(0, os.path.join(ROOT_DIR, "vlm_service"))
 
 from session_data.replay_prompt import build_prompt_at_step
 from vlm_service.custom_qwen3vl import custom_stream_generate
@@ -26,8 +27,26 @@ W8A16_MODEL = '/Users/ws/Downloads/sft_baseline_v2_w8a16'
 SESSION_DIR = os.path.join(ROOT_DIR, "session_data")
 STEPS       = [0, 1, 2]  # step 0: 1img, step 1: 2imgs, step 2: 3imgs
 MAX_TOKENS  = 200
-PREFILL_STEP = 512
+PREFILL_STEP = 8192
 N_SPEED_RUNS = 2  # per-step speed runs (fewer since we have multiple steps)
+
+
+# ── W8A8 fused_hybrid bootstrap ─────────────────────────────────
+def _init_w8a8():
+    """Bootstrap cider fused_hybrid: fix ext path, return (convert_model_fused, set_mode)."""
+    import cider.fused_hybrid as fh
+
+    # Fix _ensure_ext: _w8a8_prim lives at ROOT/cider/_cider_prim, not ext/lib/_w8a8_prim
+    if fh._w8a8_prim is None:
+        try:
+            fh._ensure_ext()
+        except (ImportError, ModuleNotFoundError):
+            # Fallback: use _cider_prim directly
+            import _cider_prim
+            fh._w8a8_prim = _cider_prim
+            fh._KERNEL_DIR = os.path.join(ROOT_DIR, "cider", "kernels")
+
+    return fh.convert_model_fused, fh.set_mode
 
 
 def load_step(session_dir, step):
@@ -41,7 +60,6 @@ def build_messages(data):
     """Build chat messages from replay_prompt data, with <image> placeholders."""
     prompt_text = data['prompt']
     n_images = prompt_text.count('<image>')
-    # Replace <image> with the VLM format
     parts = prompt_text.split('<image>')
     content = []
     for i, part in enumerate(parts):
@@ -57,8 +75,14 @@ def build_messages(data):
     return messages
 
 
-def run_generate(model, processor, messages, pil_images, use_split=False):
-    """Run one generation, return (text, timing_dict)."""
+def run_generate(model, processor, messages, pil_images, mode='default'):
+    """Run one generation, return (text, timing_dict).
+
+    mode: 'default' | 'split' | 'w8a8'
+      - default: no patching, pure GPU
+      - split: SplitLinear ANE+GPU hybrid (prefill only)
+      - w8a8: fused_hybrid W8A8 INT8 TensorOps (prefill only)
+    """
     prompt = processor.tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
@@ -67,9 +91,13 @@ def run_generate(model, processor, messages, pil_images, use_split=False):
     mx.clear_cache()
     mx.reset_peak_memory()
 
-    if use_split:
+    # Pre-prefill mode switch
+    if mode == 'split':
         from experimental.split_linear import SplitLinear
         SplitLinear.set_prefill(True)
+    elif mode == 'w8a8':
+        from cider.fused_hybrid import set_mode
+        set_mode("prefill")
 
     text = ""
     prefill_time = 0
@@ -87,19 +115,29 @@ def run_generate(model, processor, messages, pil_images, use_split=False):
         prefill_step_size=PREFILL_STEP,
         verbose=False,
     ):
-        if first_token and use_split:
-            from experimental.split_linear import SplitLinear
-            SplitLinear.set_prefill(False)
+        # Switch to decode mode after first token (end of prefill)
+        if first_token:
+            if mode == 'split':
+                from experimental.split_linear import SplitLinear
+                SplitLinear.set_prefill(False)
+            elif mode == 'w8a8':
+                from cider.fused_hybrid import set_mode
+                set_mode("decode")
             first_token = False
+
         text += resp.text
         prefill_time = resp.prompt_tokens / resp.prompt_tps if resp.prompt_tps > 0 else 0
         decode_tps = resp.generation_tps
         prompt_tokens = resp.prompt_tokens
         gen_tokens = resp.generation_tokens
 
-    if use_split:
+    # Ensure decode mode restored
+    if mode == 'split':
         from experimental.split_linear import SplitLinear
         SplitLinear.set_prefill(False)
+    elif mode == 'w8a8':
+        from cider.fused_hybrid import set_mode
+        set_mode("decode")
 
     total_time = prefill_time + (gen_tokens / decode_tps if decode_tps > 0 else 0)
 
@@ -132,7 +170,7 @@ def extract_coords(action_str):
 def main():
     print("=" * 70)
     print("  E2E Benchmark on Real Trajectory Data")
-    print("  FP16 GPU  vs  W8A16 GPU  vs  W8A16 + SplitLinear")
+    print("  FP16 GPU  vs  W8A16 GPU  vs  W8A8 GPU (prefill only)")
     print("=" * 70)
     print(f"  Session: {SESSION_DIR}")
     print(f"  Steps: {STEPS}")
@@ -148,15 +186,17 @@ def main():
         step_data[s] = (data, images, msgs)
         print(f"  Step {s}: {len(images)} images")
 
+    # configs: (key, model_path, mode, label)
+    #   mode: 'default' | 'split' | 'w8a8'
     configs = [
-        ('fp16',       FP16_MODEL,  False, "GPU FP16"),
-        ('w8a16',      W8A16_MODEL, False, "GPU W8A16"),
-        ('w8a8', W8A16_MODEL, False,  "GPU W8A8"),
+        ('fp16',   FP16_MODEL,  'default', "GPU FP16"),
+        ('w8a16',  W8A16_MODEL, 'default', "GPU W8A16"),
+        ('w8a8',   W8A16_MODEL, 'w8a8',    "GPU W8A8"),
     ]
 
-    all_results = {}  # config_key -> {step -> {text, action, coords, timings[]}}
+    all_results = {}
 
-    for cfg_key, model_path, use_split, label in configs:
+    for cfg_key, model_path, mode, label in configs:
         print(f"\n{'='*70}")
         print(f"  {label}")
         print(f"{'='*70}")
@@ -165,10 +205,14 @@ def main():
         print(f"  Loading {model_path}...")
         model, proc = vlm_load(model_path)
 
-        # Patch if split
-        if use_split:
+        # Mode-specific model conversion
+        if mode == 'split':
             from experimental.split_linear import patch_model
             bridge = patch_model(model, PREFILL_STEP, verbose=True)
+        elif mode == 'w8a8':
+            convert_model_fused, set_mode = _init_w8a8()
+            stats = convert_model_fused(model, verbose=True)
+            set_mode("decode")  # start in decode mode, run_generate switches
 
         cfg_results = {}
 
@@ -177,7 +221,7 @@ def main():
             print(f"\n  Step {s} ({len(images)} imgs):")
 
             # Warmup
-            text, timing = run_generate(model, proc, msgs, images, use_split=use_split)
+            text, timing = run_generate(model, proc, msgs, images, mode=mode)
             print(f"    Warmup: {timing['prompt_tokens']} prompt tok, "
                   f"prefill {timing['prefill_ms']:.0f}ms, "
                   f"decode {timing['decode_tps']:.1f} tok/s")
@@ -189,7 +233,7 @@ def main():
             # Speed runs
             timings = []
             for r in range(N_SPEED_RUNS):
-                _, t = run_generate(model, proc, msgs, images, use_split=use_split)
+                _, t = run_generate(model, proc, msgs, images, mode=mode)
                 timings.append(t)
                 print(f"    Run {r+1}: prefill {t['prefill_ms']:.0f}ms "
                       f"({t['prefill_tps']:.0f} tok/s) | "
@@ -252,7 +296,6 @@ def main():
     print(f"  SPEED SUMMARY (median of {N_SPEED_RUNS} runs)")
     print(f"{'='*70}")
 
-    # Per-step table
     header = f"  {'Step':>4s} {'PrTok':>5s}"
     for k in cfg_keys:
         header += f" | {cfg_labels[k]:>15s}"
@@ -279,7 +322,7 @@ def main():
         print(f" | {cfg_labels[k]:>15s}: {avg:.0f}ms avg", end="")
     print()
 
-    # Speedup
+    # Speedup vs FP16
     if 'fp16' in total_by_cfg:
         fp16_avg = np.mean(total_by_cfg['fp16'])
         print(f"\n  Speedup vs FP16:")
@@ -289,7 +332,6 @@ def main():
             avg = np.mean(total_by_cfg[k])
             print(f"    {cfg_labels[k]:15s}: {fp16_avg/avg:.2f}x overall")
 
-        # Per-step speedup
         print(f"\n  Per-step speedup vs FP16:")
         for s in STEPS:
             fp16_t = total_by_cfg['fp16'][STEPS.index(s)]
@@ -301,7 +343,18 @@ def main():
                 parts.append(f"{cfg_labels[k]}={fp16_t/t:.2f}x")
             print(f"    {' | '.join(parts)}")
 
-    # Decode speedup
+    # Speedup vs W8A16 (most relevant comparison for W8A8)
+    if 'w8a16' in total_by_cfg and 'w8a8' in total_by_cfg:
+        print(f"\n  Speedup W8A8 vs W8A16:")
+        for s in STEPS:
+            w8a16_t = total_by_cfg['w8a16'][STEPS.index(s)]
+            w8a8_t = total_by_cfg['w8a8'][STEPS.index(s)]
+            print(f"    Step {s}: {w8a16_t/w8a8_t:.2f}x")
+        w16_avg = np.mean(total_by_cfg['w8a16'])
+        w8_avg = np.mean(total_by_cfg['w8a8'])
+        print(f"    Overall: {w16_avg/w8_avg:.2f}x")
+
+    # Decode tok/s
     print(f"\n  Decode tok/s (median across all steps):")
     for k in cfg_keys:
         all_decode = []
@@ -314,7 +367,7 @@ def main():
     print(f"\n{'='*70}")
 
     # Save
-    out_path = '/tmp/e2e_w8a16_real_results.json'
+    out_path = '/tmp/e2e_wxa16_results.json'
     save_data = {}
     for k in cfg_keys:
         save_data[k] = {}

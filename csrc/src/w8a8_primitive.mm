@@ -1,10 +1,13 @@
-// W8A8 Linear V5 — Scratch Buffer Pool
-// Key optimization: reuse a single pair of scratch buffers across all
-// eval_gpu calls within the same command buffer.
+// W8A8 Linear V6 — Independent Scratch Buffers (no barrier)
 //
-// V3 problem: 196 calls × 1.8MB scratch = 352MB temporaries per chunk.
-// V5 solution: static pool of 2 buffers (a_int8 + scale_a), reused each call.
-// GPU serialization via barriers ensures correctness.
+// V5 used a shared ScratchPool with barrier between quantize & matmul.
+// This forced strict GPU serialization, preventing Metal from pipelining
+// operations across layers.
+//
+// V6 allocates independent scratch buffers per call (via add_temporary),
+// removes the barrier, and lets Metal pipeline all dispatches freely.
+// Trade-off: ~4-12MB scratch per call × 112 calls = ~672MB temporaries,
+// but Metal's allocator reclaims them after eval.
 
 #include "w8a8_primitive.h"
 #include "mlx/backend/metal/device.h"
@@ -40,48 +43,7 @@ static std::string read_file(const std::string &path) {
   return ss.str();
 }
 
-// ── Scratch buffer pool ─────────────────────────────────────────
-struct ScratchPool {
-  allocator::Buffer a_int8_buf{nullptr};
-  size_t a_int8_size = 0;
-
-  allocator::Buffer scale_a_buf{nullptr};
-  size_t scale_a_size = 0;
-
-  allocator::Buffer get_a_int8(size_t needed) {
-    if (a_int8_buf.ptr() && a_int8_size >= needed) {
-      return a_int8_buf;
-    }
-    if (a_int8_buf.ptr()) {
-      allocator::free(a_int8_buf);
-    }
-    a_int8_buf = allocator::malloc(needed);
-    a_int8_size = needed;
-    return a_int8_buf;
-  }
-
-  allocator::Buffer get_scale_a(size_t needed) {
-    if (scale_a_buf.ptr() && scale_a_size >= needed) {
-      return scale_a_buf;
-    }
-    if (scale_a_buf.ptr()) {
-      allocator::free(scale_a_buf);
-    }
-    scale_a_buf = allocator::malloc(needed);
-    scale_a_size = needed;
-    return scale_a_buf;
-  }
-
-  ~ScratchPool() {
-    if (a_int8_buf.ptr()) {
-      allocator::free(a_int8_buf);
-    }
-    if (scale_a_buf.ptr()) {
-      allocator::free(scale_a_buf);
-    }
-  }
-};
-
+// ── Pipeline cache (no scratch pool in V6) ──────────────────────
 class PipelineCache {
 public:
   static PipelineCache &instance() {
@@ -116,8 +78,6 @@ public:
     return pso;
   }
 
-  ScratchPool &scratch() { return scratch_pool_; }
-
 private:
   PipelineCache() = default;
   bool initialized_ = false;
@@ -125,7 +85,6 @@ private:
   std::unordered_map<std::string, MTL::ComputePipelineState *> pipelines_;
   MTL::Library *matmul_lib_ = nullptr;
   MTL::Library *quantize_lib_ = nullptr;
-  ScratchPool scratch_pool_;
   std::mutex mutex_;
 
   MTL::Library *compile_source(MTL::Device *mtl_device,
@@ -193,23 +152,18 @@ void W8A8Linear::eval_gpu(const std::vector<array> &inputs,
 
   auto &cache = PipelineCache::instance();
   cache.ensure_init(kernel_dir_);
-  auto &pool = cache.scratch();
 
+  // V6: allocate independent scratch buffers per call
   size_t a_bytes = static_cast<size_t>(M) * K;
   size_t sa_bytes = static_cast<size_t>(M) * sizeof(float);
 
-  // Get pooled buffers (reused across calls)
-  allocator::Buffer a_int8_buf = pool.get_a_int8(a_bytes);
-  allocator::Buffer sa_buf = pool.get_scale_a(sa_bytes);
+  array a_int8({static_cast<int>(M), static_cast<int>(K)}, int8, nullptr, {});
+  a_int8.set_data(allocator::malloc(a_bytes));
 
-  // Create arrays with no-op deleter (pool owns the memory)
-  auto noop = [](allocator::Buffer) {};
-  array a_int8(a_int8_buf, {static_cast<int>(M), static_cast<int>(K)}, int8,
-               noop);
-  array sa(sa_buf, {static_cast<int>(M)}, float32, noop);
+  array sa({static_cast<int>(M)}, float32, nullptr, {});
+  sa.set_data(allocator::malloc(sa_bytes));
 
   auto &s = stream();
-  // auto& dev removed
   auto &enc = metal::get_command_encoder(s);
 
   // DISPATCH 1: quantize_per_token
@@ -226,6 +180,8 @@ void W8A8Linear::eval_gpu(const std::vector<array> &inputs,
                               MTL::Size::Make(tg, 1, 1));
   }
 
+  // V6: barrier still needed between quantize and matmul within THIS call
+  // (matmul reads the scratch that quantize just wrote)
   enc.barrier();
 
   // DISPATCH 2: matmul_dequant
@@ -270,10 +226,12 @@ void W8A8Linear::eval_gpu(const std::vector<array> &inputs,
                               MTL::Size::Make(threads, 1, 1));
   }
 
-  // NO add_temporary — pool owns scratch buffers
-  // Safe because: quantize writes scratch → barrier → matmul reads scratch
-  // Next call's quantize overwrites scratch → barrier → next matmul reads
-  // All sequential in the same command encoder
+  // V6: register scratch buffers as temporaries so MLX frees them after eval
+  // This allows Metal to pipeline across different W8A8Linear calls
+  // (each call's quantize/matmul pair is still serial via the barrier above,
+  //  but different calls can overlap since they use independent buffers)
+  enc.add_temporary(a_int8);
+  enc.add_temporary(sa);
 }
 
 array w8a8_linear(const array &x, const array &w, const array &scale_w,
@@ -289,10 +247,17 @@ array w8a8_linear(const array &x, const array &w, const array &scale_w,
   int N = w.shape(1);
   auto stream = to_stream(s);
 
-  return array({M, N}, float16,
-               std::make_shared<W8A8Linear>(stream, kernel_dir),
-               {astype(x, float16, stream), astype(w, int8, stream),
-                astype(scale_w, float32, stream)});
+  // Kernel computes in float16 internally
+  auto result =
+      array({M, N}, float16, std::make_shared<W8A8Linear>(stream, kernel_dir),
+            {astype(x, float16, stream), astype(w, int8, stream),
+             astype(scale_w, float32, stream)});
+  // If input was bfloat16, cast output to bfloat16 to match model dtype
+  // This is a lazy cast that MLX can fuse with downstream ops
+  if (x.dtype() == bfloat16) {
+    return astype(result, bfloat16, stream);
+  }
+  return result;
 }
 
 // ── Int8MatMulInt32 primitive (raw INT32 output, no dequant) ────
@@ -309,7 +274,6 @@ void Int8MatMulInt32::eval_gpu(const std::vector<mx::array> &inputs,
   auto &out = outputs[0];
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
-  // Reuse existing PipelineCache (same compiled Metal library)
   auto &cache = PipelineCache::instance();
   cache.ensure_init(kernel_dir_);
 
