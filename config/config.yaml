@@ -1,0 +1,14 @@
+model_name_or_path: /path/to/model
+sampling:
+  max_new_tokens: 1024
+  repetition_penalty: 1.0
+  temperature: 1.0
+  top_k: null
+  top_p: 1.0
+server:
+  host: 0.0.0.0
+  max_image_buffer_size: 2
+  port: 8341
+  ttl: 1800
+w8a8:
+  mode: 'off'

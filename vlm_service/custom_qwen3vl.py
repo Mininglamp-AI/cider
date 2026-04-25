@@ -9,7 +9,6 @@ from typing import Dict, Any, Callable, Tuple, List, Generator, Union
 import functools
 from mlx_vlm.generate import (
     maybe_quantize_kv_cache,
-    generation_stream,
     normalize_resize_shape,
     wired_limit,
 )
@@ -523,7 +522,7 @@ def custom_generate_step(
     def _step(y, inputs_embeds=None):
         nonlocal tokens, kwargs
 
-        with mx.stream(generation_stream):
+        with mx.stream(mx.gpu):
             if "decoder_input_ids" in kwargs:
                 outputs = model.language_model(
                     cache=prompt_cache,
@@ -559,7 +558,7 @@ def custom_generate_step(
 
             return y, logprobs.squeeze(0)
 
-    with mx.stream(generation_stream):
+    with mx.stream(mx.gpu):
 
         # Get input embeddings (handles both multimodal and text-only)
         embedding_output = model.get_input_embeddings(
@@ -791,7 +790,7 @@ def custom_stream_generate(
         )
         return  # 直接返回，不进行生成
 
-    with wired_limit(model, [generation_stream]):
+    with wired_limit(model):
         detokenizer = processor.detokenizer
         detokenizer.reset()
         thinking_criteria = getattr(tokenizer, "thinking_budget_criteria", None)

@@ -4,7 +4,7 @@ import base64
 import json
 
 
-base_url="http://192.168.204.195:8341/v1/chat/completions"
+base_url="http://xx:8341/v1/chat/completions"
 def image_to_base64(image_path: str) -> str:
     """将图像转换为 base64"""
     with open(image_path, "rb") as f:
@@ -15,9 +15,9 @@ def example_openai_non_stream():
     print("=" * 60)
     print("OpenAI SDK 示例 - 非流式")
     print("=" * 60)
-    im0 = image_to_base64("/Users/ws/work/images/group0/0.png")
-    im1 = image_to_base64("/Users/ws/work/images/group0/1.png")
-    im2 = image_to_base64("/Users/ws/work/images/group0/2_resize1.png")
+    im0 = image_to_base64("~/work/images/group0/0.png")
+    im1 = image_to_base64("~/work/images/group0/1.png")
+    im2 = image_to_base64("~/work/images/group0/2_resize1.png")
     headers = {
         "Content-Type": "application/json",
         # "Authorization": "Bearer sk-your-key"  # 如果需要认证
@@ -55,9 +55,9 @@ def example_openai_stream():
     print("OpenAI SDK 示例 - 流式")
     print("=" * 60)
 
-    im0 = image_to_base64("/Users/ws/work/images/group0/0.png")
-    im1 = image_to_base64("/Users/ws/work/images/group0/1.png")
-    im2 = image_to_base64("/Users/ws/work/images/group0/2_resize1.png")
+    im0 = image_to_base64("~/work/images/group0/0.png")
+    im1 = image_to_base64("~/work/images/group0/1.png")
+    im2 = image_to_base64("~/work/images/group0/2_resize1.png")
     with open("message.txt", "r") as f:
         raw = json.load(f)
     payload = {
@@ -97,7 +97,7 @@ def example_openai_stream():
             },
         ],
         "images": [im0, im1, im2],
-        "request_id": "tiandu",
+        "request_id": "tiu",
         "temperature": 0.7,
         "stream": True
     }

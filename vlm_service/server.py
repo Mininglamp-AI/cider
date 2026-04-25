@@ -18,6 +18,7 @@ from core_infer import HMInference, ErrorCode
 import logging
 from io import BytesIO
 from config import load_config, get_config
+from pathlib import Path
 
 # ============= Pydantic Models for OpenAI Compatible API =============
 logging.basicConfig(
@@ -171,7 +172,8 @@ class RequestContextManager:
         with self.lock:
             current_time = time.time()
             expired_keys = [
-                key for key, ctx in self.contexts.items()
+                key
+                for key, ctx in self.contexts.items()
                 if current_time - ctx.last_accessed > self.ttl
             ]
             for key in expired_keys:
@@ -197,13 +199,7 @@ class InferenceService:
         if hasattr(self, "_initialized") and self._initialized:
             return
 
-        # 初始化HMInference单例
-        self.inference_engine = HMInference(cfg.model.model_name_or_path,
-                                            cfg.sampling.temperature,
-                                            cfg.sampling.top_k,
-                                            cfg.sampling.top_p,
-                                            cfg.sampling.repetition_penalty,
-                                            cfg.sampling.max_new_tokens)
+        self._cfg = cfg
 
         # 请求上下文管理器
         self.context_manager = RequestContextManager(cfg.server.ttl)
@@ -211,14 +207,18 @@ class InferenceService:
         # 请求队列管理器
         self.queue_manager = RequestQueueManager()
 
+        # 模型将在worker thread中加载（MLX stream亲和性）
+        self.inference_engine = None
+        self._model_ready = threading.Event()
+
         # 启动处理线程
-        self.worker_thread = threading.Thread(target=self._process_requests,
-                                              daemon=True)
+        self.worker_thread = threading.Thread(
+            target=self._process_requests, daemon=True
+        )
         self.worker_thread.start()
 
         # 启动清理线程
-        self.cleanup_thread = threading.Thread(target=self._cleanup_loop,
-                                               daemon=True)
+        self.cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
         self.cleanup_thread.start()
 
         self._initialized = True
@@ -231,7 +231,20 @@ class InferenceService:
             self.context_manager.cleanup_expired_contexts()
 
     def _process_requests(self):
-        """处理请求队列（单线程串行处理）"""
+        """处理请求队列（单线程串行处理，模型在此线程加载）"""
+        # Load model in worker thread (MLX stream affinity)
+        cfg = self._cfg
+        self.inference_engine = HMInference(
+            cfg.model.model_name_or_path,
+            cfg.sampling.temperature,
+            cfg.sampling.top_k,
+            cfg.sampling.top_p,
+            cfg.sampling.repetition_penalty,
+            cfg.sampling.max_new_tokens,
+            w8a8=cfg.w8a8.mode,
+        )
+        self._model_ready.set()
+        logger.info("Model loaded in worker thread")
         while True:
             request = self.queue_manager.get_next_request()
             if request is None:
@@ -244,8 +257,12 @@ class InferenceService:
                 else:
                     self._process_non_stream_request(request)
             except Exception as e:
+                import traceback
+
+                tb = traceback.format_exc()
                 logger.error(
-                    f"Error processing request {request.request_id}: {e}")
+                    "Error processing request %s: %s\n%s" % (request.request_id, e, tb)
+                )
                 request.result_queue.put({"status": str(e)})
 
     def _process_non_stream_request(self, request: InferenceRequest):
@@ -290,30 +307,31 @@ class InferenceService:
 
             for code, text, timing in stream_gen:
                 if code != ErrorCode.SUCCESS:
-                    request.result_queue.put({
-                        "status":
-                        code,
-                        "done":
-                        True,
-                        "prefill_time":
-                        timing["prefill_time"],
-                        "decode_tps":
-                        timing["decode_tps"],
-                        "error":
-                        code,
-                    })
+                    request.result_queue.put(
+                        {
+                            "status": code,
+                            "done": True,
+                            "prefill_time": timing["prefill_time"],
+                            "decode_tps": timing["decode_tps"],
+                            "error": code,
+                        }
+                    )
                     return
                 else:
-                    request.result_queue.put({
-                        "text": text,
-                        "done": False,
-                    })
-            request.result_queue.put({
-                "text": "",
-                "done": True,
-                "prefill_time": timing["prefill_time"],
-                "decode_tps": timing["decode_tps"],
-            })
+                    request.result_queue.put(
+                        {
+                            "text": text,
+                            "done": False,
+                        }
+                    )
+            request.result_queue.put(
+                {
+                    "text": "",
+                    "done": True,
+                    "prefill_time": timing["prefill_time"],
+                    "decode_tps": timing["decode_tps"],
+                }
+            )
         except Exception as e:
             logger.error(f"Stream error: {e}")
             request.result_queue.put({"error": str(e), "done": True})
@@ -351,6 +369,9 @@ async def lifespan(app: FastAPI):
         cfg = init_config("config.yaml")
 
     inference_service = InferenceService(cfg)
+    # Wait for model to load in worker thread (async-friendly)
+    while not inference_service._model_ready.is_set():
+        await asyncio.sleep(0.5)
     logger.info("Service started")
     yield
     logger.info("Service shutting down")
@@ -360,8 +381,7 @@ app = FastAPI(title="Mininglamp OpenAI Compatible API", lifespan=lifespan)
 
 
 def parse_openai_messages(
-    messages: List[Message],
-    images: Optional[List[Image.Image]] = None
+    messages: List[Message], images: Optional[List[Image.Image]] = None
 ) -> tuple[List[Dict], List[Image.Image]]:
     """
     解析 OpenAI 格式的消息，提取文本和图像
@@ -389,8 +409,13 @@ def parse_openai_messages(
                     # 处理图像
                     image_url = item["image_url"]["url"]
                     if image_url.startswith("data:image"):
-                        # base64 编码的图像
-                        img = base64_to_pil(image_url)
+                        # base64 编码的图像 - strip data URI prefix
+                        b64_data = (
+                            image_url.split(",", 1)[1]
+                            if "," in image_url
+                            else image_url
+                        )
+                        img = base64_to_pil(b64_data)
                         image_list.append(img)
                         text_parts.append("<image>")
                     elif image_url.startswith("http"):
@@ -408,10 +433,7 @@ def parse_openai_messages(
                         text_parts.append("<image>")
 
             if text_parts:
-                parsed_messages.append({
-                    "role": role,
-                    "content": "".join(text_parts)
-                })
+                parsed_messages.append({"role": role, "content": "".join(text_parts)})
         else:
             parsed_messages.append({"role": role, "content": str(content)})
 
@@ -426,17 +448,19 @@ def merge_params_with_config(request: ChatCompletionRequest) -> Dict:
     cfg = get_config()
 
     params = {
-        "temperature": (request.temperature if request.temperature is not None
-                        else cfg.sampling.temperature),
-        "topp":
-        request.top_p if request.top_p is not None else cfg.sampling.top_p,
-        "topk":
-        request.top_k if request.top_k is not None else cfg.sampling.top_k,
-        "repetition_penalty":
-        (request.repetition_penalty if request.repetition_penalty is not None
-         else cfg.sampling.repetition_penalty),
-        "stream":
-        request.stream,
+        "temperature": (
+            request.temperature
+            if request.temperature is not None
+            else cfg.sampling.temperature
+        ),
+        "topp": request.top_p if request.top_p is not None else cfg.sampling.top_p,
+        "topk": request.top_k if request.top_k is not None else cfg.sampling.top_k,
+        "repetition_penalty": (
+            request.repetition_penalty
+            if request.repetition_penalty is not None
+            else cfg.sampling.repetition_penalty
+        ),
+        "stream": request.stream,
     }
 
     return params
@@ -461,16 +485,14 @@ async def chat_completions(request: ChatCompletionRequest):
                 if not isinstance(img_data, str):
                     raise HTTPException(
                         status_code=400,
-                        detail=
-                        f"Invalid image data type: {type(img_data)}. Must be base64 string or URL.",
+                        detail=f"Invalid image data type: {type(img_data)}. Must be base64 string or URL.",
                     )
 
                 # 处理不同的字符串格式
                 if img_data.startswith("data:image"):
                     # data:image/jpeg;base64,xxx 格式
                     img = base64_to_pil(img_data)
-                elif img_data.startswith("http://") or img_data.startswith(
-                        "https://"):
+                elif img_data.startswith("http://") or img_data.startswith("https://"):
                     # URL 格式
                     import requests
 
@@ -483,25 +505,24 @@ async def chat_completions(request: ChatCompletionRequest):
                         img = base64_to_pil(img_data)
                     except Exception as e:
                         raise HTTPException(
-                            status_code=400,
-                            detail=f"Failed to decode image: {str(e)}")
+                            status_code=400, detail=f"Failed to decode image: {str(e)}"
+                        )
 
                 external_images.append(img)
 
         # ✅ 解析消息，传入 external_images
         parsed_messages, images = parse_openai_messages(
-            request.messages, external_images)
+            request.messages, external_images
+        )
 
         if not images:
             raise HTTPException(
                 status_code=400,
-                detail=
-                "No images found in messages. This model requires images.",
+                detail="No images found in messages. This model requires images.",
             )
 
         params = merge_params_with_config(request)
-        logger.info(
-            f"Request {request_id[:8]}: params={params}, images={len(images)}")
+        logger.info(f"Request {request_id[:8]}: params={params}, images={len(images)}")
 
         inference_request = InferenceRequest(
             request_id=request_id,
@@ -510,8 +531,7 @@ async def chat_completions(request: ChatCompletionRequest):
             params=params,
         )
 
-        result_queue = await inference_service.submit_request(inference_request
-                                                              )
+        result_queue = await inference_service.submit_request(inference_request)
 
         if request.stream:
             return StreamingResponse(
@@ -520,7 +540,8 @@ async def chat_completions(request: ChatCompletionRequest):
             )
         else:
             result = await asyncio.get_event_loop().run_in_executor(
-                None, result_queue.get)
+                None, result_queue.get
+            )
 
             if result.get("status") != ErrorCode.SUCCESS:
                 error_msg = result.get("error", "Unknown error")
@@ -533,8 +554,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 choices=[
                     ChatCompletionResponseChoice(
                         index=0,
-                        message=Message(role="assistant",
-                                        content=result["text"]),
+                        message=Message(role="assistant", content=result["text"]),
                         finish_reason="stop",
                     )
                 ],
@@ -568,7 +588,8 @@ async def stream_generator(result_queue: Queue, request_id: str, model: str):
         while True:
             # 非阻塞获取结果
             result = await asyncio.get_event_loop().run_in_executor(
-                None, result_queue.get)
+                None, result_queue.get
+            )
 
             if "error" in result:
                 # 错误情况
@@ -595,9 +616,9 @@ async def stream_generator(result_queue: Queue, request_id: str, model: str):
                     created=int(time.time()),
                     model=model,
                     choices=[
-                        ChatCompletionStreamChoice(index=0,
-                                                   delta={},
-                                                   finish_reason="stop")
+                        ChatCompletionStreamChoice(
+                            index=0, delta={}, finish_reason="stop"
+                        )
                     ],
                 )
                 yield f"data: {chunk.model_dump_json()}\n\n"
@@ -628,9 +649,9 @@ async def stream_generator(result_queue: Queue, request_id: str, model: str):
                     created=int(time.time()),
                     model=model,
                     choices=[
-                        ChatCompletionStreamChoice(index=0,
-                                                   delta={"content": text},
-                                                   finish_reason=None)
+                        ChatCompletionStreamChoice(
+                            index=0, delta={"content": text}, finish_reason=None
+                        )
                     ],
                 )
                 yield f"data: {chunk.model_dump_json()}\n\n"
@@ -638,21 +659,17 @@ async def stream_generator(result_queue: Queue, request_id: str, model: str):
     except Exception as e:
         logger.error(f"Error in stream_generator: {e}")
         error_chunk = {
-            "id":
-            request_id,
-            "object":
-            "chat.completion.chunk",
-            "created":
-            int(time.time()),
-            "model":
-            model,
-            "choices": [{
-                "index": 0,
-                "delta": {
-                    "content": f"[STREAM ERROR]: {str(e)}"
-                },
-                "finish_reason": "error",
-            }],
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": f"[STREAM ERROR]: {str(e)}"},
+                    "finish_reason": "error",
+                }
+            ],
         }
         yield f"data: {json.dumps(error_chunk)}\n\n"
         yield "data: [DONE]\n\n"
@@ -668,15 +685,16 @@ async def health():
 async def list_models():
     """列出可用模型"""
     return {
-        "object":
-        "list",
-        "data": [{
-            "id": "qwen2.5-vl",
-            "object": "model",
-            "created": int(time.time()),
-            "owned_by": "mininglamp",
-            "author": "ws",
-        }],
+        "object": "list",
+        "data": [
+            {
+                "id": "qwen3-vl",
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "mininglamp",
+                "author": "tiandu.ws",
+            }
+        ],
     }
 
 
@@ -700,19 +718,15 @@ async def queue_status():
 if __name__ == "__main__":
 
     # 只保留配置文件路径参数
+    cfg_path = str((Path(__file__).parent.parent) / Path("config/config.yaml"))
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config",
-                        type=str,
-                        default="config.yaml",
-                        help="Path to config file")
+    parser.add_argument(
+        "--config", type=str, default=cfg_path, help="Path to config file"
+    )
     args = parser.parse_args()
     # 加载配置
     config = load_config(args.config)
 
     # 启动服务
-    logger.info(
-        f"Starting server on {config.server.host}:{config.server.port}")
-    uvicorn.run(app,
-                host=config.server.host,
-                port=config.server.port,
-                log_level="info")
+    logger.info(f"Starting server on {config.server.host}:{config.server.port}")
+    uvicorn.run(app, host=config.server.host, port=config.server.port, log_level="info")

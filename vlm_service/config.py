@@ -8,14 +8,18 @@ from loguru import logger
 @dataclass
 class ModelConfig:
     """模型配置"""
-
     model_name_or_path: str
+
+
+@dataclass
+class W8A8Config:
+    """W8A8 INT8 TensorOps 配置"""
+    mode: str = "auto"   # "auto" | "on" | "off"
 
 
 @dataclass
 class SamplingConfig:
     """采样配置"""
-
     temperature: float = 1.0
     top_k: Optional[int] = None
     top_p: float = 1.0
@@ -26,7 +30,6 @@ class SamplingConfig:
 @dataclass
 class ServerConfig:
     """服务配置"""
-
     host: str = "0.0.0.0"
     port: int = 8000
     ttl: float = 1800
@@ -36,8 +39,8 @@ class ServerConfig:
 @dataclass
 class Config:
     """总配置"""
-
     model: ModelConfig
+    w8a8: W8A8Config = field(default_factory=W8A8Config)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
 
@@ -45,15 +48,24 @@ class Config:
     def from_yaml(cls, config_path: str) -> "Config":
         """从 YAML 文件加载配置"""
         config_path = Path(config_path)
-
         if not config_path.exists():
             raise FileNotFoundError(f"Config file not found: {config_path}")
 
         with open(config_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
 
+        # Parse w8a8 config
+        w8a8_raw = data.get("w8a8", {})
+        if isinstance(w8a8_raw, str):
+            w8a8_cfg = W8A8Config(mode=w8a8_raw)
+        elif isinstance(w8a8_raw, dict):
+            w8a8_cfg = W8A8Config(**w8a8_raw)
+        else:
+            w8a8_cfg = W8A8Config()
+
         return cls(
             model=ModelConfig(data["model_name_or_path"]),
+            w8a8=w8a8_cfg,
             sampling=SamplingConfig(**data.get("sampling", {})),
             server=ServerConfig(**data.get("server", {})),
         )
@@ -63,6 +75,7 @@ class Config:
         """从字典加载配置"""
         return cls(
             model=ModelConfig(**data["model"]),
+            w8a8=W8A8Config(**data.get("w8a8", {})),
             sampling=SamplingConfig(**data.get("sampling", {})),
             server=ServerConfig(**data.get("server", {})),
         )
@@ -71,19 +84,21 @@ class Config:
         """转换为字典"""
         return {
             "model": self.model.__dict__,
+            "w8a8": self.w8a8.__dict__,
             "sampling": self.sampling.__dict__,
             "server": self.server.__dict__,
         }
 
     def validate(self):
         """验证配置"""
-
-        # 检查 tokenizer 目录
         if not Path(self.model.model_name_or_path).exists():
             raise FileNotFoundError(
-                f"tokenizer_dir not found: {self.model.model_name_or_path}"
+                f"model not found: {self.model.model_name_or_path}"
             )
-
+        if self.w8a8.mode not in ("auto", "on", "off"):
+            raise ValueError(
+                f"w8a8.mode must be 'auto', 'on', or 'off', got '{self.w8a8.mode}'"
+            )
         logger.info("Config validation passed")
 
 

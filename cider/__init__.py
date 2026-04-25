@@ -1,13 +1,13 @@
 """cider — INT8 TensorOps quantized matmul for Apple M5+ (Metal 4).
 
 Quick start:
-    from cider import convert_model, set_mode
+    from cider import convert_model
 
     model, proc = load("model_path")
-    convert_model(model)          # Patch all Linear → CiderLinear
+    convert_model(model)          # Done. Prefill auto-accelerated.
 
-    set_mode("prefill")           # W8A8 INT8 TensorOps (~15-19% faster)
-    set_mode("decode")            # Original weights (zero overhead)
+    # CiderLinear auto-detects prefill (seq>1) vs decode (seq==1).
+    # No set_mode() needed. set_mode/get_mode kept as no-op for compat.
 """
 
 __version__ = "0.7.0"
