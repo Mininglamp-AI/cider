@@ -33,6 +33,18 @@ This SDK provides true INT8 activation quantization + INT8 TensorOps compute, wh
 | 128 | 0.29ms | 0.47ms | 0.40ms | **1.38x** |
 | 256 | 0.41ms | 0.69ms | 0.71ms | **1.73x** |
 
+### End-to-End LLM Prefill (Qwen3-VL-2B, Apple M5 Pro)
+
+Real model forward pass, chunked prefill (chunk=2048), bfloat16 model:
+
+| Tokens | BF16 (baseline) | W8A8 Prefill | Speedup |
+|--------|-----------------|--------------|---------|
+| 1334   | 159ms           | **134ms**    | **1.19x** |
+| 2393   | 298ms           | **254ms**    | **1.17x** |
+| 3455   | 432ms           | **374ms**    | **1.15x** |
+
+Decode uses original weights (zero overhead). Mode switching is instant.
+
 ## Requirements
 
 - macOS 26+ (Tahoe)
@@ -51,6 +63,29 @@ pip install -e .
 This runs CMake to compile the C++ extension, then installs the Python package.
 
 ## Quick Start
+
+### One-line Model Conversion (Recommended)
+
+```python
+from cider import convert_model, set_mode
+
+model, proc = load("path/to/model")  # Any MLX model
+
+# Convert all Linear layers — one line, done.
+convert_model(model)
+
+# Prefill phase: W8A8 INT8 TensorOps (~15-19% faster)
+set_mode("prefill")
+# ... run prefill ...
+
+# Decode phase: original weights (no overhead)
+set_mode("decode")
+# ... run decode loop ...
+```
+
+Works with **any MLX model** — Qwen, Llama, Mistral, etc. Automatically handles float16 and bfloat16.
+
+### Layer-level API
 
 ```python
 import numpy as np
@@ -96,6 +131,7 @@ cider/
 │   ├── __init__.py        # Public API
 │   ├── ops.py             # Primitive wrappers + quantize helpers
 │   ├── nn.py              # W8A8Linear, W4A8Linear (nn.Module)
+│   ├── convert.py         # convert_model() + set_mode() high-level API
 │   └── kernels/           # Metal shaders (bundled)
 │       ├── w8a8_matmul.metal
 │       ├── w4a8_matmul.metal
@@ -116,11 +152,10 @@ cider/
 |   ├── how_to_write_efficient_int_gemm_m5_zh.md
 ├── examples/
 │   └── basic_usage.py
-├── ane_split/             # ANE+GPU tensor parallelism (M4)
+├── experimental/             # ANE+GPU hybrid tensor parallelism (M4)
 │   ├── split_linear.py       # SplitLinear + ANEBridge + patch_model()
 │   ├── bench.py              # End-to-end benchmark
 │   ├── libane_bridge_v6.m    # ANE private API bridge (Obj-C source)
-│   ├── libane_bridge_v6.dylib
 │   └── README.md
 ├── CMakeLists.txt
 ├── pyproject.toml
@@ -211,11 +246,13 @@ See [`experimental/README.md`](experimental/README.md) for full documentation, u
 
 ## Roadmap
 
+- [x] One-line model conversion API (`convert_model` + `set_mode`)
+- [x] Automatic dtype handling (float16 / bfloat16)
+- [x] Hybrid prefill/decode mode switching
 - [ ] Group quantization for W8A8/W4A8
 - [ ] PyTorch tensor binding via pybind11
-- [ ] Fused QKV + gate/up projection layers
-- [ ] Decode path optimization (hybrid W4A16 decode + W8A8 prefill)
-- [ ] mlx_vlm and mlx_lm examples
+- [ ] SmoothQuant for activation outlier handling
+- [ ] mlx_vlm and mlx_lm integration examples
 
 ## Authors
 
