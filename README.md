@@ -67,20 +67,17 @@ This runs CMake to compile the C++ extension, then installs the Python package.
 ### One-line Model Conversion (Recommended)
 
 ```python
-from cider import convert_model, set_mode
+from cider import convert_model
 
 model, proc = load("path/to/model")  # Any MLX model
 
 # Convert all Linear layers — one line, done.
 convert_model(model)
 
-# Prefill phase: W8A8 INT8 TensorOps (~15-19% faster)
-set_mode("prefill")
-# ... run prefill ...
-
-# Decode phase: original weights (no overhead)
-set_mode("decode")
-# ... run decode loop ...
+# That's it. CiderLinear auto-detects:
+#   seq_len > 1  → W8A8 INT8 TensorOps (faster prefill)
+#   seq_len == 1 → original weights (optimal decode)
+# No manual mode switching needed.
 ```
 
 Works with **any MLX model** — Qwen, Llama, Mistral, etc. Automatically handles float16 and bfloat16.
@@ -131,7 +128,7 @@ cider/
 │   ├── __init__.py        # Public API
 │   ├── ops.py             # Primitive wrappers + quantize helpers
 │   ├── nn.py              # W8A8Linear, W4A8Linear (nn.Module)
-│   ├── convert.py         # convert_model() + set_mode() high-level API
+│   ├── convert.py         # convert_model() high-level API
 │   └── kernels/           # Metal shaders (bundled)
 │       ├── w8a8_matmul.metal
 │       ├── w4a8_matmul.metal
@@ -152,6 +149,13 @@ cider/
 |   ├── how_to_write_efficient_int_gemm_m5_zh.md
 ├── examples/
 │   └── basic_usage.py
+├── vlm_service/           # OpenAI-compatible VLM inference server
+│   ├── server.py             # FastAPI server (streaming + non-streaming)
+│   ├── core_infer.py         # HMInference engine (singleton)
+│   ├── custom_qwen3vl.py     # Custom Qwen3-VL generation loop
+│   └── config.py             # Config loader
+├── config/
+│   └── config.yaml           # Server & model configuration
 ├── experimental/             # ANE+GPU hybrid tensor parallelism (M4)
 │   ├── split_linear.py       # SplitLinear + ANEBridge + patch_model()
 │   ├── bench.py              # End-to-end benchmark
@@ -162,6 +166,82 @@ cider/
 ├── setup.py
 └── README.md
 ```
+
+## VLM Inference Service
+
+`vlm_service/` provides a ready-to-use **OpenAI-compatible** VLM inference server with W8A8 acceleration.
+
+### Quick Start
+
+1. **Configure** `config/config.yaml`:
+
+```yaml
+model_name_or_path: /path/to/your/model   # MLX VLM model (e.g., Qwen3-VL-2B W8A16)
+sampling:
+  max_new_tokens: 1024
+  temperature: 1.0
+  top_p: 1.0
+server:
+  host: 0.0.0.0
+  port: 8341
+  ttl: 1800
+w8a8:
+  mode: 'off'   # 'auto' | 'on' | 'off'
+```
+
+- `auto`: Enable W8A8 if hardware supports it, fallback to default otherwise
+- `on`: Force W8A8 (error if unsupported). "When 'on' is selected, it means your model needs to perform online activation quantization. In this case, Cider itself does **not** guarantee quantization accuracy, and you need to apply some quantization algorithms yourself, such as SmoothQuant, QuaRot, GPTQ, or even QAT, to ensure that the accuracy does not degrade significantly after activation quantization. This option simply provides a way for you to leverage the hardware's computational advantages when your model applies W8A8, rather than just simulating quantization."
+- `off`: Disable W8A8, use standard MLX inference
+
+2. **Start the server**:
+
+```bash
+cd vlm_service
+python server.py --config ../config/config.yaml
+```
+
+3. **Send requests** (OpenAI-compatible API):
+
+```bash
+# Text-only
+curl http://localhost:8341/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "vlm",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "stream": false
+  }'
+
+# With image (base64)
+curl http://localhost:8341/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "vlm",
+    "messages": [{"role": "user", "content": [
+      {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."} },
+      {"type": "text", "text": "What is in this image?"}
+    ]}],
+    "stream": true
+  }'
+```
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/chat/completions` | POST | Chat completion (stream / non-stream) |
+| `/v1/models` | GET | List available models |
+| `/health` | GET | Health check |
+| `/v1/queue` | GET | Request queue status |
+
+### How W8A8 Works in the Service
+
+When `w8a8.mode` is `auto` or `on`, the server calls `cider.convert_model()` at startup to replace all Linear layers with `CiderLinear`. During inference:
+
+- **Prefill** (processing input tokens, seq_len > 1): Uses W8A8 INT8 TensorOps for ~10-19% speedup
+- **Decode** (generating tokens one by one, seq_len == 1): Falls back to original weights with zero overhead
+
+No code changes needed — the switching is automatic based on input sequence length.
 
 ## Architecture
 
@@ -246,9 +326,9 @@ See [`experimental/README.md`](experimental/README.md) for full documentation, u
 
 ## Roadmap
 
-- [x] One-line model conversion API (`convert_model` + `set_mode`)
+- [x] One-line model conversion API (`convert_model`, auto prefill/decode)
 - [x] Automatic dtype handling (float16 / bfloat16)
-- [x] Hybrid prefill/decode mode switching
+- [x] Hybrid prefill/decode (auto-detection by sequence length)
 - [ ] Group quantization for W8A8/W4A8
 - [ ] PyTorch tensor binding via pybind11
 - [ ] SmoothQuant for activation outlier handling
