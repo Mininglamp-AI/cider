@@ -25,6 +25,8 @@ This SDK provides true INT8 activation quantization + INT8 TensorOps compute, wh
 
 ## Performance (Apple M5 Pro, 4096×4096)
 
+###  Individual Operator Latency Comparison
+
 | M | W8A8 | W4A8 | MLX W4A16 | W8A8 vs W4A16 |
 |---|------|------|-----------|---------------|
 | 1 | 0.47ms | 0.52ms | 0.21ms | 0.44x |
@@ -33,7 +35,7 @@ This SDK provides true INT8 activation quantization + INT8 TensorOps compute, wh
 | 128 | 0.29ms | 0.47ms | 0.40ms | **1.38x** |
 | 256 | 0.41ms | 0.69ms | 0.71ms | **1.73x** |
 
-### End-to-End LLM Prefill (Qwen3-VL-2B, Apple M5 Pro)
+### End-to-End VLM Prefill (Qwen3-VL-2B)
 
 Real model forward pass, chunked prefill (chunk=2048), bfloat16 model:
 
@@ -45,10 +47,77 @@ Real model forward pass, chunked prefill (chunk=2048), bfloat16 model:
 
 Decode uses original weights (zero overhead). Mode switching is instant.
 
+### LLM Quantization: Precision vs. Speed Comparison
+
+
+<table>
+  <thead>
+    <tr>
+      <th>Models</th>
+      <th>Quantization Configuration</th>
+      <th>wikitext2 PPL（&#8595）</th>
+      <th>Prefill Speed (tokens/s)（&#8593）</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td rowspan="4"><b>Qwen3-8B</b></td>
+      <td>FP16</td>
+      <td>9.729</td>
+      <td>1695</td>
+    </tr>
+    <tr>
+      <td>W4A16 (AWQ)</td>
+      <td>9.991</td>
+      <td>1628</td>
+    </tr>
+    <tr>
+      <td>W8A16 (GPTQ)</td>
+      <td>9.707</td>
+      <td>1484</td>
+    </tr>
+    <tr>
+      <td>W8A8 (GPTQ)</td>
+      <td>9.756</td>
+      <td><b>2531</b></td>
+    </tr>
+
+    
+  </tbody>
+  <tr style="border-top: 1px solid #333;">
+      <td colspan="4" style="padding: 0; height: 3px;"></td>
+    </tr>
+  <tbody>
+    <tr>
+      <td rowspan="4"><b>Llama3-8B</b></td>
+      <td>FP16</td>
+      <td>6.138</td>
+      <td>1727</td>
+    </tr>
+    <tr>
+      <td>W4A16 (GPTQ)</td>
+      <td>6.809</td>
+      <td>1579</td>
+    </tr>
+    <tr>
+      <td>W8A16 (GPTQ)</td>
+      <td>6.147</td>
+      <td>1477</td>
+    </tr>
+    <tr>
+      <td>W8A8 (GPTQ)</td>
+      <td>6.271</td>
+      <td><b>2520</b></td>
+    </tr>
+  </tbody>
+  <tr style="border-top: 1px solid #f4efef;">
+      <td colspan="4" style="padding: 0; height: 3px;"></td>
+    </tr>
+</table>
+
 ## Requirements
 
-- macOS 26+ (Tahoe)
-- Apple M5+ (Metal 4 TensorOps)
+- Apple M5 (Metal 4 TensorOps)
 - Python 3.12+
 - MLX >= 0.31
 - nanobind >= 2.12
@@ -161,6 +230,10 @@ cider/
 │   ├── bench.py              # End-to-end benchmark
 │   ├── libane_bridge_v6.m    # ANE private API bridge (Obj-C source)
 │   └── README.md
+├── tools                     # convert LLMCompressor model to mlx  and test ppl
+|   ├──convert_compressed_tensors_to_mlx.py
+|   ├──eval_w8a8.py
+|   └──eval_ppl_baseline.py
 ├── CMakeLists.txt
 ├── pyproject.toml
 ├── setup.py
@@ -329,10 +402,8 @@ See [`experimental/README.md`](experimental/README.md) for full documentation, u
 - [x] One-line model conversion API (`convert_model`, auto prefill/decode)
 - [x] Automatic dtype handling (float16 / bfloat16)
 - [x] Hybrid prefill/decode (auto-detection by sequence length)
-- [ ] Group quantization for W8A8/W4A8
-- [ ] PyTorch tensor binding via pybind11
-- [ ] SmoothQuant for activation outlier handling
-- [ ] mlx_vlm and mlx_lm integration examples
+- [x] mlx_vlm and mlx_lm integration examples
+- [ ] ANE primitives lazy evaluation
 
 ## Authors
 

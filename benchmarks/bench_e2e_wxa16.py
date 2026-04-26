@@ -22,8 +22,8 @@ from session_data.replay_prompt import build_prompt_at_step
 from vlm_service.custom_qwen3vl import custom_stream_generate
 from mlx_vlm.utils import load as vlm_load
 
-FP16_MODEL  = '/Users/ws/Downloads/sft_baseline_v2'
-W8A16_MODEL = '/Users/ws/Downloads/sft_baseline_v2_w8a16'
+FP16_MODEL  = '~/Downloads/sft_baseline_v2'
+W8A16_MODEL = '~/Downloads/sft_baseline_v2_w8a16'
 SESSION_DIR = os.path.join(ROOT_DIR, "session_data")
 STEPS       = [0, 1, 2]  # step 0: 1img, step 1: 2imgs, step 2: 3imgs
 MAX_TOKENS  = 200

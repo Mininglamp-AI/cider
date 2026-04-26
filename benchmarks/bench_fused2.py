@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT_DIR = str(Path(__file__).parent.parent)
 sys.path.insert(0, ROOT_DIR)
 
-FP16_MODEL  = '/Users/ws/Downloads/sft_baseline_v2'
+FP16_MODEL  = '~/Downloads/sft_baseline_v2'
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np

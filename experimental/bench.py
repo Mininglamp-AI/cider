@@ -17,7 +17,7 @@ from mlx_vlm.models.cache import KVCache
 
 # ─── Config ───
 SEQ = int(sys.argv[1]) if len(sys.argv) > 1 else 512
-W8A16_MODEL = '/Users/ws/Downloads/sft_baseline_v2_w8a16'
+W8A16_MODEL = '~/Downloads/sft_baseline_v2_w8a16'
 N_WARMUP = 3
 N_BENCH = 8
 

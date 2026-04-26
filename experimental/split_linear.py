@@ -394,7 +394,7 @@ if __name__ == '__main__':
 
     SEQ = int(sys.argv[1]) if len(sys.argv) > 1 else 512
     N_W = 3; N_B = 10
-    FP16_MODEL = '/Users/ws/Downloads/weights/mlx/Qwen3-VL-2B-Instruct-16bit'
+    FP16_MODEL = '~/Downloads/weights/mlx/Qwen3-VL-2B-Instruct-16bit'
 
     print(f"\n{'='*60}")
     print(f"  SplitLinear Self-Test (seq={SEQ})")
