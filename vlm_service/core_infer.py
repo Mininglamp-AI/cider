@@ -141,7 +141,10 @@ class HMInference:
                         )
                     else:
                         import mlx.core as mx
-                        stats = convert_model(self.model)
+                        try:
+                            stats = convert_model(self.model.language_model)
+                        except:
+                            stats = convert_model(self.model)
                         mx.eval(self.model.parameters())
                         self._w8a8_set_mode = set_mode
                         self._w8a8_enabled = True
