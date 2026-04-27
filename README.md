@@ -418,7 +418,7 @@ If you find this work useful, please cite:
 ```bibtex
 @software{wang2026cider,
   author = {Multimodal Team, Mininglamp Technology}，
-  title = {Cider: Hardware-Accelerated INT8 TensorOps for Apple Silicon},
+  title = {Cider: Exploiting Unused INT8 TensorOps for Faster LLM Prefill on Apple Silicon},
   year = {2026},
   howpublished = {https://github.com/Mininglamp-AI/cider}
 }
