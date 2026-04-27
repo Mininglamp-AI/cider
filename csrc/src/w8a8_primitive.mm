@@ -287,13 +287,16 @@ void Int8MatMulInt32::eval_gpu(const std::vector<mx::array> &inputs,
 
   uint32_t tiles_n = (N + BN - 1) / BN;
   uint32_t tiles_m = (M + BM - 1) / BM;
+  // Swizzle by tiles_m (same policy as w8a8_matmul_fused_dequant).
+  // Swizzling by tiles_n hurts when tiles_m is small (e.g. M=128, tiles_m=1)
+  // because the grid rearrangement has no row-interleaving to exploit.
   uint32_t swizzle_log;
-  if (tiles_n >= 4) {
-    swizzle_log = 2;
-  } else if (tiles_n >= 2) {
+  if (tiles_m <= 3) {
+    swizzle_log = 0;
+  } else if (tiles_m <= 6) {
     swizzle_log = 1;
   } else {
-    swizzle_log = 0;
+    swizzle_log = 2;
   }
   uint32_t tile = 1u << swizzle_log;
   uint32_t grid_x = tiles_n * tile;

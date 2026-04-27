@@ -1,8 +1,7 @@
 # cider
 
-Hardware-accelerated **INT8 TensorOps** quantized matmul for Apple M5+ GPUs, implemented as **MLX custom primitives** with full lazy evaluation support.
+Cider is developed on top of MLX for macOS. It provides online activation quantization operators absent in MLX, with custom int-matmul kernels built as MLX custom primitives supporting full lazy evaluation. It also extends mlx_vlm by fixing multiple bugs and adding on-device inference services.
 
-First known open-source implementation of INT8×INT8→INT32 GEMM on Apple GPU via Metal 4 `cooperative_tensor` / `matmul2d` API.
 
 ## Modes
 
@@ -15,9 +14,7 @@ First known open-source implementation of INT8×INT8→INT32 GEMM on Apple GPU v
 
 **W4A16 and W8A16 are already supported by MLX natively** — this SDK provides the missing W8A8 and W4A8 modes that MLX does not implement.
 
-## Why This Exists
-
-MLX's quantization is **weight-only**: QuantizedLinear dequantizes weights to FP16 and uses FP16 GEMM. Even with Metal 4 NAX path, MLX never uses INT8×INT8 TensorOps.
+MLX's quantization is **weight-only**: QuantizedLinear dequantizes weights to FP16 and uses FP16 GEMM. While MLX's Steel NAX templates are generic enough to be instantiated with INT8 types (and would achieve identical raw matmul throughput — [see our transparent benchmark](benchmarks/mlx_native/cider_vs_mlx_int8.md)), MLX does not provide the quantization/dequantization pipeline needed for actual W8A8 inference. Cider fills this gap with fused quantize-matmul-dequant primitives.
 
 This SDK provides true INT8 activation quantization + INT8 TensorOps compute, which:
 - **W8A8**: Up to **2x faster** than MLX W4A16 at batch sizes ≥ 32
@@ -337,7 +334,7 @@ For W4A8, step 2 includes inline INT4→INT8 unpacking in the fragment load.
 
 ### TensorOps matmul2d
 
-The INT8 GEMM uses Apple's `mpp::tensor_ops::matmul2d(16, 32, 16)` — hardware-accelerated INT8×INT8→INT32 matrix multiply available on M5+ via Metal 4's `cooperative_tensor` API.
+The INT8 GEMM uses Apple's `mpp::tensor_ops::matmul2d(16, 32, 16)` — hardware-accelerated INT8×INT8→INT32 matrix multiply available on M5+ via Metal 4's `cooperative_tensor` API. This is the same hardware instruction available to MLX's NAX templates. Cider's kernel adds fused dequantization (INT32 × scales → FP16) in the store phase, avoiding an extra device memory round-trip. See [kernel comparison](benchmarks/mlx_native/cider_vs_mlx_int8.md) for details.
 
 ### Tile Configurations
 
@@ -404,6 +401,8 @@ See [`experimental/README.md`](experimental/README.md) for full documentation, u
 - [x] Hybrid prefill/decode (auto-detection by sequence length)
 - [x] mlx_vlm and mlx_lm integration examples
 - [ ] ANE primitives lazy evaluation
+- [ ] Integrated Pruning Feature
+- [ ] KVCache quantization
 
 ## Authors
 
