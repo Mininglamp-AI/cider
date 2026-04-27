@@ -17,8 +17,8 @@ Cider is developed on top of MLX for macOS. It provides online activation quanti
 MLX's quantization is **weight-only**: QuantizedLinear dequantizes weights to FP16 and uses FP16 GEMM. While MLX's Steel NAX templates are generic enough to be instantiated with INT8 types (and would achieve identical raw matmul throughput — [see our transparent benchmark](benchmarks/mlx_native/cider_vs_mlx_int8.md)), MLX does not provide the quantization/dequantization pipeline needed for actual W8A8 inference. Cider fills this gap with fused quantize-matmul-dequant primitives.
 
 This SDK provides true INT8 activation quantization + INT8 TensorOps compute, which:
-- **W8A8**: Up to **2x faster** than MLX W4A16 at batch sizes ≥ 32
-- **W4A8**: **Half the weight memory** of W8A8, still faster than MLX W4A16
+- **W8A8**: **1.4x–2.2x** faster depending on batch size.
+- **W4A8**: Half the weight memory of W8A8, competitive with MLX W4A16 at batch sizes ≥ 16
 
 ## Performance (Apple M5 Pro, 4096×4096)
 
@@ -260,7 +260,7 @@ w8a8:
 ```
 
 - `auto`: Enable W8A8 if hardware supports it, fallback to default otherwise
-- `on`: Force W8A8 (error if unsupported). "When 'on' is selected, it means your model needs to perform online activation quantization. In this case, Cider itself does **not** guarantee quantization accuracy, and you need to apply some quantization algorithms yourself, such as SmoothQuant, QuaRot, GPTQ, or even QAT, to ensure that the accuracy does not degrade significantly after activation quantization. This option simply provides a way for you to leverage the hardware's computational advantages when your model applies W8A8, rather than just simulating quantization."
+- `on`: Force W8A8 (error if unsupported). "When 'on' is selected, it means your model needs to perform online activation quantization. In this case, Cider itself does **not** guarantee quantization accuracy, and you need to apply some quantization algorithms yourself, such as SmoothQuant, QuaRot, GPTQ, or even QAT, to ensure that the accuracy does not degrade significantly after activation quantization. This option simply provides a way for you to leverage the hardware's computational advantages when your model applies W8A8, rather than just simulating quantization." 
 - `off`: Disable W8A8, use standard MLX inference
 
 2. **Start the server**:
@@ -347,7 +347,7 @@ Auto-selected based on M. L2 cache swizzle dispatch included.
 
 ## ANE+GPU Heterogeneous Tensor Parallelism (experimental）
 
-We found that during inference on Mac, only two hardware computing units—GPU and CPU—were utilized, while the ANE (Apple Neural Engine) computing unit on Mac remained idle. We identified this as a potential optimization opportunity. Inspired by [maderix/ANE](https://github.com/maderix/ANE), we conducted experimental work on a hybrid ANE+GPU inference mode. Currently, we apply this approach to tensor parallel computing. On the M4 chip, during synchronous-only forward inference (MLX natively uses a technique called lazy evaluation, which reduces synchronization overhead; in end-to-end testing, the hybrid inference currently shows no advantage, mainly because we have not yet implemented this using MLX's lazy evaluation—this remains future work), we observed approximately **3%~16%** performance improvement compared to pure GPU inference. We believe that GPU+ANE hybrid inference should have even greater potential for improvement.
+We found that during inference on Mac, only two hardware computing units—GPU and CPU—were utilized, while the ANE (Apple Neural Engine) computing unit on Mac remained idle. We identified this as a potential optimization opportunity. Inspired by [maderix/ANE](https://github.com/maderix/ANE), we conducted experimental work on a hybrid ANE+GPU inference mode. Currently, we apply this approach to tensor parallel computing. On the M4 chip, during synchronous-only forward inference (MLX natively uses a technique called lazy evaluation, which reduces synchronization overhead; in end-to-end testing, the hybrid inference currently shows no advantage, mainly because we have not yet implemented this using MLX's lazy evaluation—this remains future work), we observed approximately **3%~16%** performance improvement compared to pure GPU inference under synchronize pipeline. We believe that GPU+ANE hybrid inference should have even greater potential for improvement.
 
 During LLM prefill, the GPU's matrix units are fully occupied — but the **Apple Neural Engine sits completely idle**. ANE Split exploits this by splitting each linear layer's GEMM along output channels:
 

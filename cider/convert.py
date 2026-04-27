@@ -10,8 +10,7 @@ Usage:
     # ... run prefill ...
     set_mode("decode")           # Original weights (no overhead)
     # ... run decode ...
-
-Works with any MLX model (Qwen, Llama, Mistral, etc.).
+works with standard MLX LLM/VLM architectures — tested on Qwen, Llama, Qwen3-VL
 Supports float16 and bfloat16 models automatically.
 """
 
