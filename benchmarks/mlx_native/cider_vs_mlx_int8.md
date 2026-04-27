@@ -3,7 +3,9 @@
 
 **MLX's Steel NAX GEMM templates are fully generic** — they can be instantiated with `<int8_t, int8_t, int32_t>` to produce a working INT8×INT8→INT32 matmul using the same `mpp::tensor_ops::matmul2d` hardware instruction as Cider. At the raw matmul level, both kernels achieve **comparable throughput** (within 2–5% across all tested sizes).
 
-Cider's contribution is **not** a novel matmul kernel. It is a **complete W8A8 inference pipeline** — fused quantization, matmul, and dequantization — that MLX does not provide.
+Cider's contribution is **not** a novel matmul kernel. It is the **first complete W8A8 inference pipeline on Apple Silicon** — and the reason it matters is simple:
+
+**Apple's M-series chips have had INT8 TensorOps since M1, delivering 2× the TOPS of FP16 — but no ML framework on macOS actually uses them.** MLX's quantization path is W4A16: it compresses weights to save memory, but computation still runs in FP16. This means prefill (the compute-bound phase of LLM inference) gets zero benefit from INT8 hardware. W8A8 is the only quantization scheme that accelerates both compute and memory: activations and weights are both INT8, so the matmul runs on the faster INT8 datapath. Cider provides the missing pipeline — online activation quantization, INT8 TensorOps matmul, and fused dequantization — to unlock this dormant hardware capability. End-to-end prefill speedup: **1.15–1.21× over W8A16** on Qwen3-VL-2B (M5 Pro), with negligible accuracy loss (PPL Δ < 0.01 on Llama-3-8B).
 
 ## Background: What MLX Does Today
 

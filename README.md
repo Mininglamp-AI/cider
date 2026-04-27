@@ -347,7 +347,7 @@ Auto-selected based on M. L2 cache swizzle dispatch included.
 
 ## ANE+GPU Heterogeneous Tensor Parallelism (experimental）
 
-We found that during inference on Mac, only two hardware computing units—GPU and CPU—were utilized, while the ANE (Apple Neural Engine) computing unit on Mac remained idle. We identified this as a potential optimization opportunity. Inspired https://github.com/maderix/ANE, we conducted experimental work on a hybrid ANE+GPU inference mode. Currently, we apply this approach to tensor parallel computing. On the M4 chip, during synchronous-only forward inference (MLX natively uses a technique called lazy evaluation, which reduces synchronization overhead; in end-to-end testing, the hybrid inference currently shows no advantage, mainly because we have not yet implemented this using MLX's lazy evaluation—this remains future work), we observed approximately **3%~16%** performance improvement compared to pure GPU inference. We believe that GPU+ANE hybrid inference should have even greater potential for improvement.
+We found that during inference on Mac, only two hardware computing units—GPU and CPU—were utilized, while the ANE (Apple Neural Engine) computing unit on Mac remained idle. We identified this as a potential optimization opportunity. Inspired by [maderix/ANE](https://github.com/maderix/ANE), we conducted experimental work on a hybrid ANE+GPU inference mode. Currently, we apply this approach to tensor parallel computing. On the M4 chip, during synchronous-only forward inference (MLX natively uses a technique called lazy evaluation, which reduces synchronization overhead; in end-to-end testing, the hybrid inference currently shows no advantage, mainly because we have not yet implemented this using MLX's lazy evaluation—this remains future work), we observed approximately **3%~16%** performance improvement compared to pure GPU inference. We believe that GPU+ANE hybrid inference should have even greater potential for improvement.
 
 During LLM prefill, the GPU's matrix units are fully occupied — but the **Apple Neural Engine sits completely idle**. ANE Split exploits this by splitting each linear layer's GEMM along output channels:
 
@@ -417,10 +417,10 @@ If you find this work useful, please cite:
 
 ```bibtex
 @software{wang2026cider,
-  author = {Multimodal Team, Mininglamp Technology}
+  author = {Multimodal Team, Mininglamp Technology}，
   title = {Cider: Hardware-Accelerated INT8 TensorOps for Apple Silicon},
   year = {2026},
-  howpublished = {GitHub}
+  howpublished = {https://github.com/Mininglamp-AI/cider}
 }
 ```
 

@@ -34,3 +34,6 @@ include = ["cider*"]
 
 [tool.setuptools.package-data]
 "cider" = ["kernels/*.metal", "lib/*.so", "lib/*.dylib"]
+
+[project.optional-dependencies]
+serve = ["fastapi", "uvicorn", "pyyaml"]

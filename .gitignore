@@ -2,7 +2,6 @@
 build/
 dist/
 *.egg-info/
-mlx_wxa8/lib/
 
 # Python
 __pycache__/
