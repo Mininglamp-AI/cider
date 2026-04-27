@@ -145,6 +145,8 @@ convert_model(model)
 #   seq_len == 1 → original weights (optimal decode)
 # No manual mode switching needed.
 ```
+**Important**
+When quantizing Vision-Language Models (VLMs), the vision transformer (ViT) is generally not replaced. Directly using convert(model) will quantize the vision model's linear layers as well, which typically causes accuracy drop. For VLMs, we recommend calling convert(model.language_model) to apply existing quantization methods like GPTQ, SmoothQuant, and AWQ to the language model only.
 
 Works with **any MLX model** — Qwen, Llama, Mistral, etc. Automatically handles float16 and bfloat16.
 
