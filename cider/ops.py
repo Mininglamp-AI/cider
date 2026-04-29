@@ -71,20 +71,20 @@ def is_available() -> bool:
 def quantize_weight_int8(
     w: np.ndarray,
 ) -> tuple:
-    """Quantize FP16/FP32 weights to per-column symmetric INT8.
+    """Quantize FP16/FP32 weights to per-row symmetric INT8.
 
     Args:
-        w: Weight matrix [K, N] as numpy array.
+        w: Weight matrix [N, K] as numpy array (N=out_features, K=in_features).
 
     Returns:
-        (w_int8, scale_w) where w_int8 is [K, N] int8 and
-        scale_w is [N] float32.
+        (w_int8, scale_w) where w_int8 is [N, K] int8 and
+        scale_w is [N] float32 (one scale per output channel).
     """
     w = w.astype(np.float32)
-    col_max = np.max(np.abs(w), axis=0)  # [N]
-    scale = col_max / 127.0
+    row_max = np.max(np.abs(w), axis=1)  # [N]
+    scale = row_max / 127.0
     scale = np.where(scale == 0, 1.0, scale)
-    w_int8 = np.clip(np.round(w / scale[np.newaxis, :]), -128, 127).astype(np.int8)
+    w_int8 = np.clip(np.round(w / scale[:, np.newaxis]), -128, 127).astype(np.int8)
     return w_int8, scale.astype(np.float32)
 
 
@@ -131,8 +131,8 @@ def w8a8_linear(
 
     Args:
         x: Input activations [M, K] float16 or bfloat16.
-        w: INT8 weights [K, N] int8 (per-column quantized).
-        scale_w: Per-column weight scales [N] float32.
+        w: INT8 weights [N, K] int8 (per-row quantized, N=out_features).
+        scale_w: Per-row weight scales [N] float32.
         stream: Optional MLX stream for scheduling.
 
     Returns:
@@ -188,13 +188,13 @@ def int8_matmul_int32(
 ) -> mx.array:
     """Raw INT8×INT8→INT32 matmul (bit-exact, no dequant).
 
-    Pure integer GEMM: C[i,j] = sum_k A[i,k] * B[k,j].
+    Pure integer GEMM: C[i,j] = sum_k A[i,k] * B[j,k] (B is transposed).
     No activation quantization, no scale dequant.
     Result is exact — suitable for bit-level correctness testing.
 
     Args:
         a: INT8 matrix [M, K].
-        b: INT8 matrix [K, N].
+        b: INT8 matrix [N, K] (transposed weight layout).
         stream: Optional MLX stream.
 
     Returns:

@@ -140,13 +140,13 @@ private:
 void W8A8Linear::eval_gpu(const std::vector<array> &inputs,
                           std::vector<array> &outputs) {
   auto &x = inputs[0];       // [M, K] float16
-  auto &w = inputs[1];       // [K, N] int8
+  auto &w = inputs[1];       // [N, K] int8
   auto &scale_w = inputs[2]; // [N] float32
   auto &out = outputs[0];    // [M, N] float16
 
   uint32_t M = static_cast<uint32_t>(x.shape(0));
-  uint32_t K = static_cast<uint32_t>(w.shape(0));
-  uint32_t N = static_cast<uint32_t>(w.shape(1));
+  uint32_t N = static_cast<uint32_t>(w.shape(0));
+  uint32_t K = static_cast<uint32_t>(w.shape(1));
 
   out.set_data(allocator::malloc(out.nbytes()));
 
@@ -240,11 +240,11 @@ array w8a8_linear(const array &x, const array &w, const array &scale_w,
     throw std::invalid_argument("w8a8_linear: x must be 2D [M,K]");
   }
   if (w.ndim() != 2) {
-    throw std::invalid_argument("w8a8_linear: w must be 2D [K,N]");
+    throw std::invalid_argument("w8a8_linear: w must be 2D [N,K]");
   }
 
   int M = x.shape(0);
-  int N = w.shape(1);
+  int N = w.shape(0);
   auto stream = to_stream(s);
 
   // Kernel computes in float16 internally
@@ -265,11 +265,11 @@ array w8a8_linear(const array &x, const array &w, const array &scale_w,
 void Int8MatMulInt32::eval_gpu(const std::vector<mx::array> &inputs,
                                std::vector<mx::array> &outputs) {
   auto &a = inputs[0]; // [M, K] int8
-  auto &b = inputs[1]; // [K, N] int8
+  auto &b = inputs[1]; // [N, K] int8
 
   uint32_t M = static_cast<uint32_t>(a.shape(0));
-  uint32_t K = static_cast<uint32_t>(a.shape(1));
-  uint32_t N = static_cast<uint32_t>(b.shape(1));
+  uint32_t N = static_cast<uint32_t>(b.shape(0));
+  uint32_t K = static_cast<uint32_t>(b.shape(1));
 
   auto &out = outputs[0];
   out.set_data(mx::allocator::malloc(out.nbytes()));
@@ -322,7 +322,7 @@ mx::array int8_matmul_int32(const mx::array &a, const mx::array &b,
                             const std::string &kernel_dir,
                             mx::StreamOrDevice s) {
   uint32_t M = static_cast<uint32_t>(a.shape(0));
-  uint32_t N = static_cast<uint32_t>(b.shape(1));
+  uint32_t N = static_cast<uint32_t>(b.shape(0));
   return mx::array(
       {static_cast<int>(M), static_cast<int>(N)}, mx::int32,
       std::make_shared<Int8MatMulInt32>(mx::to_stream(s), kernel_dir),

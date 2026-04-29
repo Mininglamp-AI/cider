@@ -32,6 +32,7 @@ add_library(cider_prim_lib)
 target_sources(cider_prim_lib PUBLIC
   ${CMAKE_CURRENT_LIST_DIR}/csrc/src/w8a8_primitive.mm
   ${CMAKE_CURRENT_LIST_DIR}/csrc/src/w4a8_primitive.mm
+  ${CMAKE_CURRENT_LIST_DIR}/csrc/src/mv_bench_primitive.mm
 )
 
 target_include_directories(cider_prim_lib PUBLIC

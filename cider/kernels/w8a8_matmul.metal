@@ -2,6 +2,9 @@
 // W8A8 INT8×INT8→INT32 TensorOps GEMM
 // Target: Apple M5 (G17G), Metal 4
 //
+// Weight layout: B is [N, K] (row-major), transpose_b=true
+// Computes: C[M,N] = A[M,K] × B[N,K]^T
+//
 // Variants:
 //   - fused dequant: INT8×INT8→FP16, with per-token/per-channel scales
 //   - raw INT32: INT8×INT8→INT32, no scale (pure integer GEMM)
@@ -75,14 +78,10 @@ inline void nax_frag_store_dequant(const thread int32_t *src, device half *dst,
   }
 }
 
-// ── Generic GEMM kernel ─────────────────────────────────────────
-// Template params: BM, BN, BK, SK, WM, WN
-// Each SG computes SM×SN = (BM/WM) × (BN/WN) output
-// SM and SN must be 32 (2×2 of 16×16 fragments)
-//
-// swizzle_log: passed via constant buffer
-//   tid_y = (tgid.y << swizzle_log) + (tgid.x & ((1<<swizzle_log)-1))
-//   tid_x = tgid.x >> swizzle_log
+// ── Generic GEMM kernel (B is [N, K], transpose_b) ─────────────
+// Computes: C[M,N] = A[M,K] × B[N,K]^T
+// A is [M, K] row-major, B is [N, K] row-major
+// B fragments loaded as [N_tile, K_tile] and hardware transposes via transpose_b=true
 template <int BM, int BN, int BK, int SK, int WM, int WN>
 void w8a8_gemm_impl(const device int8_t *A, const device int8_t *B,
                     device half *C, uint M, uint N, uint K,
@@ -99,7 +98,6 @@ void w8a8_gemm_impl(const device int8_t *A, const device int8_t *B,
   uint tid_y = (tgid.y << swizzle_log) + (tgid.x & ((1u << swizzle_log) - 1u));
   uint tid_x = tgid.x >> swizzle_log;
 
-  // Bounds check (swizzle can create out-of-bounds tiles)
   if (tid_x >= tiles_n || tid_y >= tiles_m) {
     return;
   }
@@ -110,11 +108,14 @@ void w8a8_gemm_impl(const device int8_t *A, const device int8_t *B,
   uint m_base = tid_y * BM + sg_row * SM;
   uint n_base = tid_x * BN + sg_col * SN;
 
+  // A: [M, K] row-major — same as before
   const device int8_t *sg_A = A + m_base * K;
-  const device int8_t *sg_B = B + n_base;
+  // B: [N, K] row-major — pointer to start of n_base-th row
+  const device int8_t *sg_B = B + n_base * K;
 
+  // transpose_b=true: right operand is [N_frag, K_frag], hardware transposes
   constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-      16, 32, 16, false, false, true,
+      16, 32, 16, false, true, true,
       mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
   mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> gemm_op;
 
@@ -141,21 +142,24 @@ void w8a8_gemm_impl(const device int8_t *A, const device int8_t *B,
 
     for (int kk1 = 0; kk1 < BK; kk1 += SK) {
       int8_t a_frags[TM][TK][kElemsPerFrag];
-      int8_t b_frags[TK][TN][kElemsPerFrag];
+      int8_t b_frags[TN][TK][kElemsPerFrag];  // [N_tile, K_tile] for transpose_b
       volatile int compiler_barrier;
 
+      // Load A fragments: [M_tile, K_tile], ld=K
       for (short mm = 0; mm < TM; mm++) {
         for (short kk = 0; kk < TK; kk++) {
           nax_frag_load(a_frags[mm][kk], sg_A + kk1, int(K), sc, short(mm * 16),
                         short(kk * 16));
         }
       }
-      for (short kk = 0; kk < TK; kk++) {
-        for (short nn = 0; nn < TN; nn++) {
-          nax_frag_load(b_frags[kk][nn], sg_B + kk1 * N, int(N), sc,
-                        short(kk * 16), short(nn * 16));
+      // Load B fragments: [N_tile, K_tile], ld=K (B is [N, K] row-major)
+      for (short nn = 0; nn < TN; nn++) {
+        for (short kk = 0; kk < TK; kk++) {
+          nax_frag_load(b_frags[nn][kk], sg_B + kk1, int(K), sc, short(nn * 16),
+                        short(kk * 16));
         }
       }
+      // Compute: ct_a=[M_frag, K_frag], ct_b=[N_frag, K_frag] (transpose_b)
       for (short mm = 0; mm < TM; mm++) {
         for (short nn = 0; nn < TN; nn += 2) {
           for (short kk = 0; kk < TK; kk++) {
@@ -163,8 +167,8 @@ void w8a8_gemm_impl(const device int8_t *A, const device int8_t *B,
               ct_a[i] = a_frags[mm][kk][i];
             }
             for (short i = 0; i < kElemsPerFrag; i++) {
-              ct_b[i] = b_frags[kk][nn][i];
-              ct_b[kElemsPerFrag + i] = b_frags[kk][nn + 1][i];
+              ct_b[i] = b_frags[nn][kk][i];
+              ct_b[kElemsPerFrag + i] = b_frags[nn + 1][kk][i];
             }
             short c0 = mm * TN + nn, c1 = c0 + 1;
             for (short i = 0; i < kElemsPerFrag; i++) {
@@ -183,7 +187,7 @@ void w8a8_gemm_impl(const device int8_t *A, const device int8_t *B,
     }
 
     sg_A += BK;
-    sg_B += BK * N;
+    sg_B += BK;  // B is [N, K]: K advances by BK along columns
   }
 
   // ── Remainder K ─────────────────────────────────────────────
@@ -193,6 +197,7 @@ void w8a8_gemm_impl(const device int8_t *A, const device int8_t *B,
     int8_t b_frag[TN][kElemsPerFrag];
     short psk = short(max(0, rem_k - kk1));
 
+    // Load A remainder: same as before
     for (short mm = 0; mm < TM; mm++) {
       const device int8_t *ptr = sg_A + kk1 + (sc.y + mm * 16) * K + sc.x;
       for (short i = 0; i < 2; i++) {
@@ -204,13 +209,14 @@ void w8a8_gemm_impl(const device int8_t *A, const device int8_t *B,
       }
     }
 
+    // Load B remainder: B is [N, K], reading [N_tile, K_rem]
     for (short nn = 0; nn < TN; nn++) {
-      const device int8_t *ptr = sg_B + kk1 * N + nn * 16 + sc.y * N + sc.x;
+      const device int8_t *ptr = sg_B + kk1 + (sc.y + nn * 16) * K + sc.x;
       for (short i = 0; i < 2; i++) {
         for (short j = 0; j < kElemCols; j++) {
-          short ki = short(sc.y + i * kElemRowsJump);
+          short ki = short(sc.x + j);
           b_frag[nn][i * kElemCols + j] =
-              (ki < psk) ? ptr[(i * kElemRowsJump) * N + j] : int8_t(0);
+              (ki < psk) ? ptr[(i * kElemRowsJump) * K + j] : int8_t(0);
         }
       }
     }
@@ -248,11 +254,9 @@ void w8a8_gemm_impl(const device int8_t *A, const device int8_t *B,
 }
 
 // ============================================================
-// Kernel entry points
+// Kernel entry points — fused dequant
 // ============================================================
 
-// ── Large tile: BM=128, BN=128, BK=512, WM=4, WN=4 ────────────
-// 16 SG, 512 threads/TG. Best for M≥128.
 kernel void w8a8_matmul_fused_dequant(
     const device int8_t *A [[buffer(0)]], const device int8_t *B [[buffer(1)]],
     device half *C [[buffer(2)]], constant uint &M [[buffer(3)]],
@@ -269,8 +273,6 @@ kernel void w8a8_matmul_fused_dequant(
                                           sgid, lid);
 }
 
-// ── Small tile: BM=32, BN=128, BK=512, WM=1, WN=4 ─────────────
-// 4 SG, 128 threads/TG. Optimized for M≤64.
 kernel void w8a8_matmul_fused_dequant_small(
     const device int8_t *A [[buffer(0)]], const device int8_t *B [[buffer(1)]],
     device half *C [[buffer(2)]], constant uint &M [[buffer(3)]],
@@ -288,7 +290,7 @@ kernel void w8a8_matmul_fused_dequant_small(
 }
 
 // ============================================================
-// Raw INT32 GEMM impl (no dequant, no scales)
+// Raw INT32 GEMM impl (B is [N, K], transpose_b=true)
 // ============================================================
 
 template <int BM, int BN, int BK, int SK, int WM, int WN>
@@ -304,9 +306,7 @@ void w8a8_gemm_int32_impl(const device int8_t *A, const device int8_t *B,
 
   uint tid_y = (tgid.y << swizzle_log) + (tgid.x & ((1u << swizzle_log) - 1u));
   uint tid_x = tgid.x >> swizzle_log;
-  if (tid_x >= tiles_n || tid_y >= tiles_m) {
-    return;
-  }
+  if (tid_x >= tiles_n || tid_y >= tiles_m) return;
 
   short2 sc = nax_get_coord(ushort(lid));
   uint sg_row = sgid / WN;
@@ -315,58 +315,45 @@ void w8a8_gemm_int32_impl(const device int8_t *A, const device int8_t *B,
   uint n_base = tid_x * BN + sg_col * SN;
 
   const device int8_t *sg_A = A + m_base * K;
-  const device int8_t *sg_B = B + n_base;
+  const device int8_t *sg_B = B + n_base * K;
 
   constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-      16, 32, 16, false, false, true,
+      16, 32, 16, false, true, true,
       mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
   mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> gemm_op;
 
-  auto ct_a =
-      gemm_op.get_left_input_cooperative_tensor<int8_t, int8_t, int32_t>();
-  auto ct_b =
-      gemm_op.get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
-  auto ct_c =
-      gemm_op.get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b),
-                                                 int32_t>();
+  auto ct_a = gemm_op.get_left_input_cooperative_tensor<int8_t, int8_t, int32_t>();
+  auto ct_b = gemm_op.get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
+  auto ct_c = gemm_op.get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), int32_t>();
 
   int32_t c_frags[TM * TN][kElemsPerFrag];
-  for (int f = 0; f < TM * TN; f++) {
-    for (int i = 0; i < kElemsPerFrag; i++) {
+  for (int f = 0; f < TM * TN; f++)
+    for (int i = 0; i < kElemsPerFrag; i++)
       c_frags[f][i] = 0;
-    }
-  }
 
   int gemm_k_iters = int(K) / BK;
   for (int kk0 = 0; kk0 < gemm_k_iters; kk0++) {
     threadgroup_barrier(mem_flags::mem_none);
     for (int kk1 = 0; kk1 < BK; kk1 += SK) {
       int8_t a_frags[TM][TK][kElemsPerFrag];
-      int8_t b_frags[TK][TN][kElemsPerFrag];
+      int8_t b_frags[TN][TK][kElemsPerFrag];
       volatile int compiler_barrier;
 
-      for (short mm = 0; mm < TM; mm++) {
-        for (short kk = 0; kk < TK; kk++) {
-          nax_frag_load(a_frags[mm][kk], sg_A + kk1, int(K), sc, short(mm * 16),
-                        short(kk * 16));
-        }
-      }
-      for (short kk = 0; kk < TK; kk++) {
-        for (short nn = 0; nn < TN; nn++) {
-          nax_frag_load(b_frags[kk][nn], sg_B + kk1 * N, int(N), sc,
-                        short(kk * 16), short(nn * 16));
-        }
-      }
+      for (short mm = 0; mm < TM; mm++)
+        for (short kk = 0; kk < TK; kk++)
+          nax_frag_load(a_frags[mm][kk], sg_A + kk1, int(K), sc, short(mm*16), short(kk*16));
+
+      for (short nn = 0; nn < TN; nn++)
+        for (short kk = 0; kk < TK; kk++)
+          nax_frag_load(b_frags[nn][kk], sg_B + kk1, int(K), sc, short(nn*16), short(kk*16));
 
       for (short mm = 0; mm < TM; mm++) {
         for (short nn = 0; nn < TN; nn += 2) {
           for (short kk = 0; kk < TK; kk++) {
+            for (short i = 0; i < kElemsPerFrag; i++) ct_a[i] = a_frags[mm][kk][i];
             for (short i = 0; i < kElemsPerFrag; i++) {
-              ct_a[i] = a_frags[mm][kk][i];
-            }
-            for (short i = 0; i < kElemsPerFrag; i++) {
-              ct_b[i] = b_frags[kk][nn][i];
-              ct_b[kElemsPerFrag + i] = b_frags[kk][nn + 1][i];
+              ct_b[i] = b_frags[nn][kk][i];
+              ct_b[kElemsPerFrag + i] = b_frags[nn+1][kk][i];
             }
             short c0 = mm * TN + nn, c1 = c0 + 1;
             for (short i = 0; i < kElemsPerFrag; i++) {
@@ -384,7 +371,7 @@ void w8a8_gemm_int32_impl(const device int8_t *A, const device int8_t *B,
       (void)compiler_barrier;
     }
     sg_A += BK;
-    sg_B += BK * N;
+    sg_B += BK;
   }
 
   // Remainder K
@@ -393,30 +380,25 @@ void w8a8_gemm_int32_impl(const device int8_t *A, const device int8_t *B,
     int8_t a_frag[TM][kElemsPerFrag];
     int8_t b_frag[TN][kElemsPerFrag];
     short psk = short(max(0, rem_k - kk1));
+
     for (short mm = 0; mm < TM; mm++) {
       const device int8_t *ptr = sg_A + kk1 + (sc.y + mm * 16) * K + sc.x;
-      for (short i = 0; i < 2; i++) {
+      for (short i = 0; i < 2; i++)
         for (short j = 0; j < kElemCols; j++) {
           short ki = short(sc.x + j);
-          a_frag[mm][i * kElemCols + j] =
-              (ki < psk) ? ptr[(i * kElemRowsJump) * K + j] : int8_t(0);
+          a_frag[mm][i * kElemCols + j] = (ki < psk) ? ptr[(i * kElemRowsJump) * K + j] : int8_t(0);
         }
-      }
     }
     for (short nn = 0; nn < TN; nn++) {
-      const device int8_t *ptr = sg_B + kk1 * N + nn * 16 + sc.y * N + sc.x;
-      for (short i = 0; i < 2; i++) {
+      const device int8_t *ptr = sg_B + kk1 + (sc.y + nn * 16) * K + sc.x;
+      for (short i = 0; i < 2; i++)
         for (short j = 0; j < kElemCols; j++) {
-          short ki = short(sc.y + i * kElemRowsJump);
-          b_frag[nn][i * kElemCols + j] =
-              (ki < psk) ? ptr[(i * kElemRowsJump) * N + j] : int8_t(0);
+          short ki = short(sc.x + j);
+          b_frag[nn][i * kElemCols + j] = (ki < psk) ? ptr[(i * kElemRowsJump) * K + j] : int8_t(0);
         }
-      }
     }
     for (short mm = 0; mm < TM; mm++) {
-      for (short i = 0; i < kElemsPerFrag; i++) {
-        ct_a[i] = a_frag[mm][i];
-      }
+      for (short i = 0; i < kElemsPerFrag; i++) ct_a[i] = a_frag[mm][i];
       for (short i = 0; i < kElemsPerFrag; i++) {
         ct_b[i] = b_frag[0][i];
         ct_b[kElemsPerFrag + i] = b_frag[1][i];
@@ -436,12 +418,9 @@ void w8a8_gemm_int32_impl(const device int8_t *A, const device int8_t *B,
 
   // Store raw INT32
   device int32_t *D = C + m_base * N + n_base;
-  for (short mm = 0; mm < TM; mm++) {
-    for (short nn = 0; nn < TN; nn++) {
-      nax_frag_store_int32(c_frags[mm * TN + nn], D, int(N), sc, short(mm * 16),
-                           short(nn * 16), M, N, m_base, n_base);
-    }
-  }
+  for (short mm = 0; mm < TM; mm++)
+    for (short nn = 0; nn < TN; nn++)
+      nax_frag_store_int32(c_frags[mm * TN + nn], D, int(N), sc, short(mm*16), short(nn*16), M, N, m_base, n_base);
 }
 
 // ============================================================
