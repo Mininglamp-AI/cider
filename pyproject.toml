@@ -30,7 +30,7 @@ classifiers = [
 Homepage = "https://github.com/Mininglamp-AI/cider"
 
 [tool.setuptools.packages.find]
-include = ["cider*"]
+include = ["cider*", "vlm_service*"]
 
 [tool.setuptools.package-data]
 "cider" = ["kernels/*.metal", "lib/*.so", "lib/*.dylib"]

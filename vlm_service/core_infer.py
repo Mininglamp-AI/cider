@@ -1,10 +1,10 @@
-from code_def import ErrorCode
+from .code_def import ErrorCode
 import time
 import logging
 from collections import defaultdict
 from typing import List, Optional, Dict
 import mlx_vlm as pm
-from custom_qwen3vl import *
+from .custom_qwen3vl import *
 
 logging.basicConfig(level=logging.ERROR)
 import warnings
