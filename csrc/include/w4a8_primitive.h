@@ -8,7 +8,7 @@
 
 #include <string>
 
-namespace w8a8_mlx {
+namespace cider {
 
 namespace mx = mlx::core;
 
@@ -52,4 +52,4 @@ mx::array w4a8_linear(
     const std::string& kernel_dir,
     mx::StreamOrDevice s = {});
 
-}  // namespace w8a8_mlx
+}  // namespace cider

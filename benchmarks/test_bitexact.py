@@ -44,7 +44,7 @@ def test_bitexact():
     for M, K, N in SHAPES:
         np.random.seed(42)
         a_np = np.random.randint(-128, 128, (M, K), dtype=np.int8)
-        b_np = np.random.randint(-128, 128, (K, N), dtype=np.int8)
+        b_np = np.random.randint(-128, 128, (N, K), dtype=np.int8)
 
         # GPU kernel
         c_gpu = int8_matmul_int32(mx.array(a_np), mx.array(b_np))
@@ -52,7 +52,7 @@ def test_bitexact():
         c_gpu_np = np.array(c_gpu)
 
         # Numpy reference (int64 to avoid overflow in accumulation)
-        c_ref = (a_np.astype(np.int64) @ b_np.astype(np.int64)).astype(np.int32)
+        c_ref = (a_np.astype(np.int64) @ b_np.astype(np.int64).T).astype(np.int32)
 
         # Bit-exact check
         match = np.array_equal(c_gpu_np, c_ref)

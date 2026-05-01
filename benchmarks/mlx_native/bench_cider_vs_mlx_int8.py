@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import mlx.core as mx
-from cider import w8a8_linear, quantize_weight_int8
+from cider import perchannel_linear, quantize_weight_int8
 from cider.ops import int8_matmul_int32
 
 # =============================================================
@@ -181,12 +181,12 @@ SHAPES = [
 def bench_cider_w8a8(x, w_int8, scale_w):
     """Cider full pipeline: quantize_act + int8_matmul + fused_dequant -> FP16"""
     for _ in range(WARMUP):
-        y = w8a8_linear(x, w_int8, scale_w)
+        y = perchannel_linear(x, w_int8, scale_w)
         mx.eval(y)
     times = []
     for _ in range(REPEAT):
         t0 = time.perf_counter()
-        y = w8a8_linear(x, w_int8, scale_w)
+        y = perchannel_linear(x, w_int8, scale_w)
         mx.eval(y)
         times.append(time.perf_counter() - t0)
     return np.median(times) * 1000

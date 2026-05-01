@@ -14,7 +14,7 @@
 #include <sstream>
 #include <unordered_map>
 
-namespace w8a8_mlx {
+namespace cider {
 
 using namespace mlx::core;
 
@@ -282,4 +282,4 @@ array w4a8_linear(const array &x, const array &packed_w, const array &scale_w,
        astype(scale_w, float32, stream)});
 }
 
-} // namespace w8a8_mlx
+} // namespace cider

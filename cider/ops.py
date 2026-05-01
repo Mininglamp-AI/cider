@@ -1,4 +1,4 @@
-"""cider.ops — Low-level primitive API for W8A8 / W4A8 linear.
+"""cider.ops — Low-level primitive API for W8A8 / W4A8 / per-group linear.
 
 These functions return lazy mx.array nodes. Computation happens when
 you call mx.eval() — fully compatible with MLX's graph-based execution.
@@ -32,23 +32,25 @@ def _load_ext():
     global _ext
     if _ext is not None:
         return _ext
-    # The compiled extension lives in lib/ next to this package
     import sys
     lib_dir = str(Path(__file__).parent / "lib")
     if lib_dir not in sys.path:
         sys.path.insert(0, lib_dir)
-    import _cider_prim
-    _ext = _cider_prim
-    return _ext
+    try:
+        import _cider_prim
+        _ext = _cider_prim
+        return _ext
+    except ImportError:
+        raise RuntimeError(
+            "Cider C++ extension not available. INT8 TensorOps require Apple M5+. "
+            "On M4 and below, use standard MLX inference instead."
+        )
 
 
 # ── Hardware detection ──────────────────────────────────────────
 
 def is_available() -> bool:
-    """Check if INT8 TensorOps are available (Apple M5+, Metal 4).
-
-    Returns False on M4 and earlier, or if the extension fails to load.
-    """
+    """Check if INT8 TensorOps are available (Apple M5+, Metal 4)."""
     try:
         chip = subprocess.run(
             ["sysctl", "-n", "machdep.cpu.brand_string"],
@@ -62,7 +64,7 @@ def is_available() -> bool:
     try:
         _load_ext()
         return True
-    except Exception:
+    except (ImportError, RuntimeError, Exception):
         return False
 
 
@@ -109,40 +111,97 @@ def pack_weight_int4(
     col_max = np.max(np.abs(w), axis=0)
     scale = col_max / 7.0
     scale = np.where(scale == 0, 1.0, scale)
-    # Quantize to [0, 15] with zero_point
     w_q = np.clip(np.round(w / scale[np.newaxis, :]) + zero_point, 0, 15).astype(np.uint8)
-    # Pack: high nibble = even rows, low nibble = odd rows
     packed = (w_q[0::2, :] << 4) | w_q[1::2, :]
     return packed, scale.astype(np.float32)
 
 
 # ── Primitive API ───────────────────────────────────────────────
 
-def w8a8_linear(
+def perchannel_linear(
     x: mx.array,
     w: mx.array,
     scale_w: mx.array,
+    bias: Optional[mx.array] = None,
     stream: Optional[mx.Stream] = None,
 ) -> mx.array:
-    """W8A8 quantized linear: y = dequant(quant_a(x) @ w_int8).
-
-    This returns a lazy mx.array — computation is deferred until
-    mx.eval() is called, integrating with MLX's computation graph.
+    """W8A8 per-channel quantized linear: y = dequant(quant_a(x) @ w_int8) + bias.
 
     Args:
         x: Input activations [M, K] float16 or bfloat16.
-        w: INT8 weights [N, K] int8 (per-row quantized, N=out_features).
+        w: INT8 weights [N, K] int8 (per-row quantized).
         scale_w: Per-row weight scales [N] float32.
-        stream: Optional MLX stream for scheduling.
+        stream: Optional MLX stream.
 
     Returns:
-        Output [M, N] matching input dtype (float16 or bfloat16).
+        Output [M, N] matching input dtype.
     """
     ext = _load_ext()
     out_dtype = x.dtype
     kw = {"stream": stream} if stream is not None else {}
-    result = ext.w8a8_linear(x, w, scale_w, kernel_dir(), **kw)
-    # Kernel outputs float16; cast to input dtype if needed (lazy, near-zero cost)
+    N = w.shape[0]
+    if bias is None:
+        bias = mx.zeros((N,), dtype=mx.float16)
+    result = ext.perchannel_linear(x, w, scale_w, bias, kernel_dir(), **kw)
+    if out_dtype != mx.float16:
+        result = result.astype(out_dtype, **kw)
+    return result
+
+
+# Shared placeholder for new_bias (V5 kernel ignores it; Metal needs valid buffer)
+_shared_new_bias_cache = {}
+
+def _get_shared_new_bias_placeholder(N: int, num_groups: int):
+    key = (N, num_groups)
+    if key not in _shared_new_bias_cache:
+        _shared_new_bias_cache[key] = mx.zeros((N, num_groups), dtype=mx.float32)
+    return _shared_new_bias_cache[key]
+
+
+def pergroup_linear(
+    x: mx.array,
+    w: mx.array,
+    scale_w: mx.array,
+    group_size: int,
+    bias: Optional[mx.array] = None,
+    new_bias: Optional[mx.array] = None,
+    stream: Optional[mx.Stream] = None,
+) -> mx.array:
+    """
+    mlx native quantize format asymmetric affine
+    quantize: q = clip(round((w - biases) / scales), 0, 2^b - 1), b = bits
+    dequantize: w = q*scale + bias
+    """
+    """Per-group INT8 linear with optional bias.
+
+    Dispatches internally:
+      M > 1 → per-group GEMM (activation quantize + INT8 TensorOps)
+      M == 1 → per-group MV (FP activation, weight dequant on-the-fly)
+
+    Args:
+        x: Input activations [M, K] float16 or bfloat16.
+        w: INT8 weights [N, K] int8 (per-group symmetric quantized).
+        scale_w: Per-group weight scales [N, num_groups] float32.
+        group_size: Group size (64, 128, or 256).
+        bias: Optional bias [N] float16. Default zeros.
+        stream: Optional MLX stream.
+
+    Returns:
+        Output [M, N] matching input dtype.
+    """
+    ext = _load_ext()
+    N = w.shape[0]
+    num_groups = scale_w.shape[1] if scale_w.ndim == 2 else 1
+    if bias is None:
+        bias = mx.zeros((N,), dtype=mx.float16)
+    if new_bias is None:
+        # V5 kernel ignores new_bias (symmetric quantization), but Metal
+        # requires a valid buffer binding.  Use a tiny shared placeholder
+        # instead of allocating (N, num_groups) every forward call.
+        new_bias = _get_shared_new_bias_placeholder(N, num_groups)
+    out_dtype = x.dtype
+    kw = {"stream": stream} if stream is not None else {}
+    result = ext.pergroup_linear(x, w, scale_w, bias, new_bias, group_size, kernel_dir(), **kw)
     if out_dtype != mx.float16:
         result = result.astype(out_dtype, **kw)
     return result
@@ -156,18 +215,11 @@ def w4a8_linear(
 ) -> mx.array:
     """W4A8 quantized linear: y = dequant(quant_a(x) @ unpack4(w)).
 
-    Packed INT4 weights are unpacked to INT8 on-the-fly in the Metal
-    kernel. Activation quantization (FP16 -> INT8) is fused in the
-    same command buffer.
-
-    This returns a lazy mx.array — computation is deferred until
-    mx.eval() is called.
-
     Args:
         x: Input activations [M, K] float16.
         packed_w: Packed INT4 weights [K//2, N] uint8.
         scale_w: Per-column weight scales [N] float32.
-        stream: Optional MLX stream for scheduling.
+        stream: Optional MLX stream.
 
     Returns:
         Output [M, N] float16.
@@ -187,10 +239,6 @@ def int8_matmul_int32(
     stream=None,
 ) -> mx.array:
     """Raw INT8×INT8→INT32 matmul (bit-exact, no dequant).
-
-    Pure integer GEMM: C[i,j] = sum_k A[i,k] * B[j,k] (B is transposed).
-    No activation quantization, no scale dequant.
-    Result is exact — suitable for bit-level correctness testing.
 
     Args:
         a: INT8 matrix [M, K].

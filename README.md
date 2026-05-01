@@ -2,12 +2,26 @@
 
 Cider is developed on top of MLX for macOS. It provides online activation quantization operators absent in MLX, with custom int-matmul kernels built as MLX custom primitives supporting full lazy evaluation. It also extends mlx_vlm by fixing multiple bugs and adding on-device inference services.
 
+## Conditional Compilation (M4 / M5)
+
+Cider uses **conditional compilation**: the INT8 TensorOps C++ extension is only built on Apple M5+.
+
+| Chip | `pip install -e .` behavior | `import cider` behavior |
+|------|----------------------------|------------------------|
+| **M5+** | Full build (CMake + Metal kernels) | All features available |
+| **M4 and below** | Skips C++ build, installs pure-Python package | `is_available()` → False, `convert_model()` is a warning no-op |
+
+**Override via environment variable:**
+```bash
+CIDER_FORCE_BUILD=1 pip install -e .   # Force build (e.g., CI)
+CIDER_FORCE_BUILD=0 pip install -e .   # Force skip
+```
 
 ## Modes
 
 | Mode | Weights | Activations | Compute Path | Status |
 |------|---------|-------------|--------------|--------|
-| **W8A8** | INT8 per-column | INT8 per-token | TensorOps matmul2d | ✅ Stable |
+| **W8A8** | INT8 symmetric | INT8 per-token | TensorOps matmul2d | ✅ Stable |
 | **W4A8** | INT4 packed (uint8) | INT8 per-token | Unpack→TensorOps | ✅ Stable |
 | W4A16 | — | — | MLX built-in | Baseline |
 | W8A16 | — | — | MLX built-in | Baseline |
@@ -17,12 +31,30 @@ Cider is developed on top of MLX for macOS. It provides online activation quanti
 MLX's quantization is **weight-only**: QuantizedLinear dequantizes weights to FP16 and uses FP16 GEMM. While MLX's Steel NAX templates are generic enough to be instantiated with INT8 types (and would achieve identical raw matmul throughput — [see our transparent benchmark](benchmarks/mlx_native/cider_vs_mlx_int8.md)), MLX does not provide the quantization/dequantization pipeline needed for actual W8A8 inference. Cider fills this gap with fused quantize-matmul-dequant primitives.
 
 This SDK provides true INT8 activation quantization + INT8 TensorOps compute, which:
-- **W8A8**: **1.4x–2.2x** faster depending on batch size.
+- **W8A8**: **1.4x–2.2x** faster prefill depending on batch size
 - **W4A8**: Half the weight memory of W8A8, competitive with MLX W4A16 at batch sizes ≥ 16
 
-## Performance (Apple M5 Pro, 4096×4096)
+### W8A8 Quantization Granularity
 
-###  Individual Operator Latency Comparison
+| Granularity | Description | Speed | Precision |
+|-------------|-------------|-------|-----------|
+| **Per-channel** | One scale per output channel | Fastest (1.8x prefill) | Slightly lower |
+| **Per-group (gs=128)** | One scale per 128 elements | Fast (1.5x prefill) | Near-lossless |
+| **Per-group (gs=64)** | One scale per 64 elements | Moderate (1.3x prefill) | Near-lossless |
+
+## Performance (Apple M5 Pro)
+
+### End-to-End VLM (Qwen3-VL-2B, Real Trajectory)
+
+| Metric | FP16 | W8A16 (MLX) | **W8A8 (Cider)** |
+|--------|------|-------------|------------------|
+| Decode (tok/s) | 70 | 100 | **95** |
+| Prefill (tok/s) | 2900 | 1900 | **2100** |
+| Overall | baseline | 1.0x | **1.08x faster** |
+
+W8A8 decode is within 5% of MLX W8A16. Total end-to-end (prefill + decode) is 8% faster than W8A16 and 10% faster than FP16.
+
+### Individual Operator Latency (4096×4096)
 
 | M | W8A8 | W4A8 | MLX W4A16 | W8A8 vs W4A16 |
 |---|------|------|-----------|---------------|
@@ -32,18 +64,6 @@ This SDK provides true INT8 activation quantization + INT8 TensorOps compute, wh
 | 128 | 0.29ms | 0.47ms | 0.40ms | **1.38x** |
 | 256 | 0.41ms | 0.69ms | 0.71ms | **1.73x** |
 
-### End-to-End VLM Prefill (Qwen3-VL-2B)
-
-Real model forward pass, chunked prefill (chunk=2048), bfloat16 model:
-
-| Tokens | BF16 (baseline) | W8A8 Prefill | Speedup |
-|--------|-----------------|--------------|---------|
-| 1334   | 159ms           | **134ms**    | **1.19x** |
-| 2393   | 298ms           | **254ms**    | **1.17x** |
-| 3455   | 432ms           | **374ms**    | **1.15x** |
-
-Decode uses original weights (zero overhead). Mode switching is instant.
-
 ### LLM Quantization: Precision vs. Speed Comparison
 
 
@@ -52,73 +72,89 @@ Decode uses original weights (zero overhead). Mode switching is instant.
     <tr>
       <th>Models</th>
       <th>Quantization Configuration</th>
-      <th>wikitext2 PPL（&#8595）</th>
-      <th>Prefill Speed (tokens/s)（&#8593）</th>
+      <th>wikitext2 PPL（↓）</th>
+      <th>Prefill Time (s)（↓）</th>
+      <th>Peak Memory (GB)（↓）</th>
     </tr>
   </thead>
   <tbody>
     <tr>
-      <td rowspan="4"><b>Qwen3-8B</b></td>
+      <td rowspan="5"><b>Qwen3-8B</b></td>
       <td>FP16</td>
-      <td>9.729</td>
-      <td>1695</td>
+      <td>9.726</td>
+      <td>179.9</td>
+      <td>18.93</td>
     </tr>
     <tr>
-      <td>W4A16 (AWQ)</td>
-      <td>9.991</td>
-      <td>1628</td>
-    </tr>
-    <tr>
-      <td>W8A16 (GPTQ)</td>
+      <td>W8A16 (mlx RTN)</td>
       <td>9.707</td>
-      <td>1484</td>
+      <td>221.3</td>
+      <td>12.07</td>
     </tr>
     <tr>
-      <td>W8A8 (GPTQ)</td>
+      <td>W8A8 (per-channel)</td>
       <td>9.756</td>
-      <td><b>2531</b></td>
+      <td><b>123.5</b></td>
+      <td><b>11.32</b></td>
     </tr>
-
-    
+    <tr>
+      <td>W8A8 (per-group gs=64)</td>
+      <td>9.744</td>
+      <td>179.1</td>
+      <td>11.83</td>
+    </tr>
+    <tr>
+      <td>W8A8 (per-group gs=128)</td>
+      <td>9.727</td>
+      <td>165.8</td>
+      <td>11.61</td>
+    </tr>
   </tbody>
   <tr style="border-top: 1px solid #333;">
-      <td colspan="4" style="padding: 0; height: 3px;"></td>
-    </tr>
+      <td colspan="5" style="padding: 0; height: 3px;"></td>
+  </tr>
   <tbody>
     <tr>
-      <td rowspan="4"><b>Llama3-8B</b></td>
+      <td rowspan="5"><b>Llama3-8B</b></td>
       <td>FP16</td>
       <td>6.138</td>
-      <td>1727</td>
+      <td>175.8</td>
+      <td>18.32</td>
     </tr>
     <tr>
-      <td>W4A16 (GPTQ)</td>
-      <td>6.809</td>
-      <td>1579</td>
-    </tr>
-    <tr>
-      <td>W8A16 (GPTQ)</td>
+      <td>W8A16 (mlx RTN)</td>
       <td>6.147</td>
-      <td>1477</td>
+      <td>236.9</td>
+      <td>11.46</td>
     </tr>
     <tr>
-      <td>W8A8 (GPTQ)</td>
+      <td>W8A8 (per-channel)</td>
       <td>6.271</td>
-      <td><b>2520</b></td>
+      <td><b>123.3</b></td>
+      <td><b>10.69</b></td>
+    </tr>
+    <tr>
+      <td>W8A8 (per-group, gs=64)</td>
+      <td>6.269</td>
+      <td>178.7</td>
+      <td>11.19</td>
+    </tr>
+    <tr>
+      <td>W8A8 (per-group, gs=128)</td>
+      <td>6.270</td>
+      <td>155.7</td>
+      <td>10.98</td>
     </tr>
   </tbody>
-  <tr style="border-top: 1px solid #f4efef;">
-      <td colspan="4" style="padding: 0; height: 3px;"></td>
-    </tr>
 </table>
 
 ## Requirements
 
-- Apple M5 (Metal 4 TensorOps)
+- **Apple M5+** for INT8 TensorOps (M4 and below: installs as pure-Python, `is_available()` returns False)
 - Python 3.12+
 - MLX >= 0.31
-- nanobind >= 2.12
-- CMake >= 3.27
+- nanobind >= 2.12 (only needed on M5+ for C++ build)
+- CMake >= 3.27 (only needed on M5+ for C++ build)
 
 ## Install
 
@@ -126,27 +162,29 @@ Decode uses original weights (zero overhead). Mode switching is instant.
 pip install -e .
 ```
 
-This runs CMake to compile the C++ extension, then installs the Python package.
+On M5+, this runs CMake to compile the C++ extension, then installs the Python package.
+On M4 and below, only the Python package is installed (no compilation errors).
 
 ## Quick Start
 
 ### One-line Model Conversion (Recommended)
 
 ```python
-from cider import convert_model
+from cider import convert_model, is_available
 
 model, proc = load("path/to/model")  # Any MLX model
 
-# Convert all Linear layers — one line, done.
-convert_model(model)
-
-# That's it. CiderLinear auto-detects:
-#   seq_len > 1  → W8A8 INT8 TensorOps (faster prefill)
-#   seq_len == 1 → original weights (optimal decode)
-# No manual mode switching needed.
+if is_available():
+    convert_model(model)
+    # CiderLinear auto-detects:
+    #   seq_len > 1  → W8A8 INT8 TensorOps (faster prefill)
+    #   seq_len == 1 → INT8 MV kernel (near-native decode speed)
+else:
+    pass  # Falls back to standard MLX inference on M4
 ```
+
 **Important**
-When quantizing Vision-Language Models (VLMs), the vision transformer (ViT) is generally not replaced. Directly using convert(model) will quantize the vision model's linear layers as well, which typically causes accuracy drop. For VLMs, we recommend calling convert(model.language_model) to apply existing quantization methods like GPTQ, SmoothQuant, and AWQ to the language model only.
+When quantizing Vision-Language Models (VLMs), the vision transformer (ViT) is generally not replaced. Directly using convert_model will quantize the vision model's linear layers as well, which typically causes accuracy drop. For VLMs, we recommend calling convert_model(model.language_model) to apply existing quantization methods like GPTQ, SmoothQuant, and AWQ to the language model only.
 
 Works with **any MLX model** — Qwen, Llama, Mistral, etc. Automatically handles float16 and bfloat16.
 
@@ -162,8 +200,13 @@ assert is_available(), "Requires Apple M5+"
 # Prepare weight
 W = np.random.randn(4096, 4096).astype(np.float16)
 
-# W8A8 linear
-layer = W8A8Linear.from_weights(W)
+# W8A8 linear (per-channel)
+from cider.ops import quantize_weight_int8
+w_int8, scale = quantize_weight_int8(W)
+layer = W8A8Linear(
+    w_int8=mx.array(w_int8), scale_w=mx.array(scale),
+    group_size=0, in_features=4096, out_features=4096
+)
 x = mx.random.normal((32, 4096)).astype(mx.float16)
 y = layer(x)    # lazy — builds MLX graph
 mx.eval(y)       # GPU executes
@@ -177,14 +220,14 @@ mx.eval(y4)
 ## Low-Level API
 
 ```python
-from cider import w8a8_linear, w4a8_linear, quantize_weight_int8, pack_weight_int4
+from cider import perchannel_linear, w4a8_linear, quantize_weight_int8, pack_weight_int4
 
 # Quantize weights (numpy, offline)
 w_int8, scale = quantize_weight_int8(W_np)
 packed_w4, scale4 = pack_weight_int4(W_np)
 
 # Primitive calls (return lazy mx.array)
-y = w8a8_linear(x, mx.array(w_int8), mx.array(scale))
+y = perchannel_linear(x, mx.array(w_int8), mx.array(scale))
 y4 = w4a8_linear(x, mx.array(packed_w4), mx.array(scale4))
 ```
 
@@ -193,35 +236,48 @@ y4 = w4a8_linear(x, mx.array(packed_w4), mx.array(scale4))
 ```
 cider/
 ├── cider/              # Python package
-│   ├── __init__.py        # Public API
+│   ├── __init__.py        # Public API (conditional on is_available)
 │   ├── ops.py             # Primitive wrappers + quantize helpers
-│   ├── nn.py              # W8A8Linear, W4A8Linear (nn.Module)
+│   ├── nn.py              # CiderLinear, W4A8Linear (nn.Module)
 │   ├── convert.py         # convert_model() high-level API
 │   └── kernels/           # Metal shaders (bundled)
-│       ├── w8a8_matmul.metal
-│       ├── w4a8_matmul.metal
-│       └── w8a8_quantize.metal
-├── csrc/                  # C++ MLX primitives (nanobind)
+│       ├── w8a8_matmul.metal       # W8A8 GEMM (prefill, M>1)
+│       ├── w8a8_int8_mv.metal      # W8A8 per-channel MV (decode, M=1)
+│       ├── w8a8_quantize.metal     # Per-token activation quantization
+│       ├── w4a8_matmul.metal       # W4A8 GEMM (prefill)
+│       ├── pergroup_int8_gemm.metal # Per-group GEMM (prefill)
+│       └── pergroup_int8_mv.metal   # Per-group MV (decode)
+├── csrc/                  # C++ MLX primitives (nanobind, M5+ only)
 │   ├── include/
 │   │   ├── w8a8_primitive.h
-│   │   └── w4a8_primitive.h
+│   │   ├── w4a8_primitive.h
+│   │   └── pergroup_primitive.h
 │   └── src/
 │       ├── w8a8_primitive.mm
 │       ├── w4a8_primitive.mm
+│       ├── pergroup_primitive.mm
 │       └── prim_bindings.cpp
-├── tests/
 ├── benchmarks/
-|   └── bench_kernels
-├── tutorial
-|   ├── how_to_write_efficient_int_gemm_m5_en.md
-|   ├── how_to_write_efficient_int_gemm_m5_zh.md
+│   ├── bench_e2e_wxa16.py    # End-to-end VLM benchmark (Qwen3-VL-2B)
+│   ├── bench_full.py         # Isolated kernel latency (per-channel/per-group vs MLX)
+│   ├── test_bitexact.py      # Numerical correctness verification
+│   └── mlx_native/           # MLX native INT8 comparison
+├── tutorial/
+│   ├── how_to_write_efficient_int_gemm_m5_en.md
+│   └── how_to_write_efficient_int_gemm_m5_zh.md
+├── tools/
+│   ├── eval_ppl_all.py               # Unified PPL eval (FP16/W8A16/per-channel/per-group)
+│   ├── convert_compressed_tensors_to_mlx.py
+│   └── smoothquant.py                # SmoothQuant calibration
 ├── examples/
 │   └── basic_usage.py
 ├── vlm_service/           # OpenAI-compatible VLM inference server
 │   ├── server.py             # FastAPI server (streaming + non-streaming)
 │   ├── core_infer.py         # HMInference engine (singleton)
 │   ├── custom_qwen3vl.py     # Custom Qwen3-VL generation loop
-│   └── config.py             # Config loader
+│   ├── config.py             # Config loader
+│   ├── bench_client.py       # Server benchmark client
+│   └── client.py             # API client example
 ├── config/
 │   └── config.yaml           # Server & model configuration
 ├── experimental/             # ANE+GPU hybrid tensor parallelism (M4)
@@ -229,13 +285,9 @@ cider/
 │   ├── bench.py              # End-to-end benchmark
 │   ├── libane_bridge_v6.m    # ANE private API bridge (Obj-C source)
 │   └── README.md
-├── tools                     # convert LLMCompressor model to mlx  and test ppl
-|   ├──convert_compressed_tensors_to_mlx.py
-|   ├──eval_w8a8.py
-|   └──eval_ppl_baseline.py
 ├── CMakeLists.txt
 ├── pyproject.toml
-├── setup.py
+├── setup.py               # Conditional build (M5+: full, M4: pure-Python)
 └── README.md
 ```
 
@@ -262,7 +314,7 @@ w8a8:
 ```
 
 - `auto`: Enable W8A8 if hardware supports it, fallback to default otherwise
-- `on`: Force W8A8 (error if unsupported). "When 'on' is selected, it means your model needs to perform online activation quantization. In this case, Cider itself does **not** guarantee quantization accuracy, and you need to apply some quantization algorithms yourself, such as SmoothQuant, QuaRot, GPTQ, or even QAT, to ensure that the accuracy does not degrade significantly after activation quantization. This option simply provides a way for you to leverage the hardware's computational advantages when your model applies W8A8, rather than just simulating quantization." 
+- `on`: Force W8A8 (error if unsupported). "When 'on' is selected, it means your model needs to perform online activation quantization. In this case, Cider itself does **not** guarantee quantization accuracy, and you need to apply some quantization algorithms yourself, such as SmoothQuant, QuaRot, GPTQ, or even QAT, to ensure that the accuracy does not degrade significantly after activation quantization. This option simply provides a way for you to leverage the hardware's computational advantages when your model applies W8A8, rather than just simulating quantization."
 - `off`: Disable W8A8, use standard MLX inference
 
 2. **Start the server**:
@@ -310,8 +362,8 @@ curl http://localhost:8341/v1/chat/completions \
 
 When `w8a8.mode` is `auto` or `on`, the server calls `cider.convert_model()` at startup to replace all Linear layers with `CiderLinear`. During inference:
 
-- **Prefill** (processing input tokens, seq_len > 1): Uses W8A8 INT8 TensorOps for ~10-19% speedup
-- **Decode** (generating tokens one by one, seq_len == 1): Falls back to original weights with zero overhead
+- **Prefill** (processing input tokens, seq_len > 1): Uses W8A8 INT8 GEMM for faster computation
+- **Decode** (generating tokens one by one, seq_len == 1): Uses INT8 MV kernel (near-native speed)
 
 No code changes needed — the switching is automatic based on input sequence length.
 
@@ -327,12 +379,16 @@ Both W8A8Linear and W4A8Linear are implemented as `mlx::core::Primitive` subclas
 
 ### Metal Kernel Pipeline
 
-Each primitive dispatches two Metal compute kernels in a single command encoder:
+Each primitive dispatches Metal compute kernels:
 
+**Prefill (M > 1):**
 1. **quantize_per_token**: FP16 activations → INT8 + per-token scales
 2. **matmul_fused_dequant**: INT8 × INT8 → INT32 → FP16 (with fused scale dequantization)
 
-For W4A8, step 2 includes inline INT4→INT8 unpacking in the fragment load.
+**Decode (M = 1):**
+- **int8_mv**: Direct INT8 matrix-vector product with on-the-fly weight dequantization (no activation quantization needed)
+
+For W4A8, the GEMM step includes inline INT4→INT8 unpacking in the fragment load.
 
 ### TensorOps matmul2d
 
@@ -347,7 +403,7 @@ The INT8 GEMM uses Apple's `mpp::tensor_ops::matmul2d(16, 32, 16)` — hardware-
 
 Auto-selected based on M. L2 cache swizzle dispatch included.
 
-## ANE+GPU Heterogeneous Tensor Parallelism (experimental）
+## ANE+GPU Heterogeneous Tensor Parallelism (experimental)
 
 We found that during inference on Mac, only two hardware computing units—GPU and CPU—were utilized, while the ANE (Apple Neural Engine) computing unit on Mac remained idle. We identified this as a potential optimization opportunity. Inspired by [maderix/ANE](https://github.com/maderix/ANE), we conducted experimental work on a hybrid ANE+GPU inference mode. Currently, we apply this approach to tensor parallel computing. On the M4 chip, during synchronous-only forward inference (MLX natively uses a technique called lazy evaluation, which reduces synchronization overhead; in end-to-end testing, the hybrid inference currently shows no advantage, mainly because we have not yet implemented this using MLX's lazy evaluation—this remains future work), we observed approximately **3%~16%** performance improvement compared to pure GPU inference under synchronize pipeline. We believe that GPU+ANE hybrid inference should have even greater potential for improvement.
 
@@ -383,7 +439,7 @@ See [`experimental/README.md`](experimental/README.md) for full documentation, u
 
 | Component | Scheme | Granularity |
 |-----------|--------|-------------|
-| W8A8 weights | Symmetric INT8 | Per-column |
+| W8A8 weights | Symmetric INT8 | Per-channel or per-group (gs=64/128) |
 | W4A8 weights | Symmetric INT4 (zp=8) | Per-column |
 | Activations | Symmetric INT8 | Per-token |
 | Accumulation | INT32 | — |
@@ -391,16 +447,29 @@ See [`experimental/README.md`](experimental/README.md) for full documentation, u
 
 ## Limitations
 
-- **M=1 (decode)**: Slower than MLX W4A16 due to activation quantization overhead. For decode, use MLX's native W4A16.
-- **Apple M5+ only**: Metal 4 TensorOps required. M1-M4 not supported.
-- **Per-column quantization only**: No group quantization yet.
+- **M=1 individual operator**: Per-channel MV kernel is slower than MLX W4A16 for isolated decode calls. The per-group MV kernel is within 5% of MLX W8A16 decode speed in end-to-end benchmarks.
+- **Apple M5+ only** for INT8 TensorOps: M4 and below installs but `is_available()` returns False.
 - **W4A8 slower than W8A8**: INT4→INT8 unpack ALU overhead (Metal 4 matmul2d has no native INT4 operand).
+
+## Tools
+
+### Unified PPL Evaluation
+
+```bash
+# Run all 5 configurations in one script
+python tools/eval_ppl_all.py --num-samples 50
+
+# Evaluates: FP16, W8A16 (MLX native), W8A8 per-channel, per-group(gs=64), per-group(gs=128)
+# Outputs comparison table at the end
+```
 
 ## Roadmap
 
 - [x] One-line model conversion API (`convert_model`, auto prefill/decode)
 - [x] Automatic dtype handling (float16 / bfloat16)
-- [x] Hybrid prefill/decode (auto-detection by sequence length)
+- [x] Per-channel and per-group W8A8 quantization
+- [x] Dedicated decode MV kernel (matches native MLX speed)
+- [x] Conditional compilation (M4 graceful fallback)
 - [x] mlx_vlm and mlx_lm integration examples
 - [ ] ANE primitives lazy evaluation
 - [ ] Integrated Pruning Feature
@@ -419,7 +488,7 @@ If you find this work useful, please cite:
 
 ```bibtex
 @software{wang2026cider,
-  author = {Multimodal Team, Mininglamp Technology}，
+  author = {Multimodal Team, Mininglamp Technology},
   title = {Cider: Exploiting Unused INT8 TensorOps for Faster LLM Prefill on Apple Silicon},
   year = {2026},
   howpublished = {https://github.com/Mininglamp-AI/cider}

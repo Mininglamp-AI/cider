@@ -6,10 +6,6 @@ Usage:
     model, proc = load("model_path")
     convert_model(model)         # Patch all Linear layers in-place
 
-    set_mode("prefill")          # W8A8 INT8 TensorOps (~15-19% faster)
-    # ... run prefill ...
-    set_mode("decode")           # Original weights (no overhead)
-    # ... run decode ...
 works with standard MLX LLM/VLM architectures — tested on Qwen, Llama, Qwen3-VL
 Supports float16 and bfloat16 models automatically.
 """
@@ -23,7 +19,7 @@ from . import ops
 from .nn import CiderLinear
 
 # Re-export mode control from nn (single source of truth)
-from .nn import set_mode, get_mode  # noqa: F401
+
 
 # ── Model conversion ───────────────────────────────────────────
 _TARGET_TYPES = (nn.Linear, nn.QuantizedLinear)

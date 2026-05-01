@@ -132,7 +132,7 @@ def _w8a8_gemm(x, weight_int8, scales):
         x_2d = mx.reshape(x, (-1, K))
     else:
         x_2d = x
-    y_2d = _w8a8_prim.w8a8_linear(x_2d, weight_int8, scales, _KERNEL_DIR)
+    y_2d = _w8a8_prim.perchannel_linear(x_2d, weight_int8, scales, _KERNEL_DIR)
     if x.ndim > 2:
         return mx.reshape(y_2d, orig_shape[:-1] + (N,))
     return y_2d

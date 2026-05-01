@@ -64,13 +64,15 @@ inline void nax_frag_store_dequant(const thread int32_t *src, device half *dst,
                                    int ld, short2 sc, short off_m, short off_n,
                                    uint M, uint N, uint m_base, uint n_base,
                                    const device float *scale_a,
-                                   const device float *scale_w) {
+                                   const device float *scale_w,
+                                   const device half *bias) {
   for (short i = 0; i < 2; i++) {
     for (short j = 0; j < kElemCols; j++) {
       uint mi = m_base + sc.y + off_m + i * kElemRowsJump;
       uint ni = n_base + sc.x + off_n + j;
       if (mi < M && ni < N) {
-        float val = float(src[i * kElemCols + j]) * scale_a[mi] * scale_w[ni];
+        float val = float(src[i * kElemCols + j]) * scale_a[mi] * scale_w[ni] +
+                    float(bias[ni]);
         dst[(sc.y + off_m + i * kElemRowsJump) * ld + (sc.x + off_n + j)] =
             half(val);
       }
@@ -81,13 +83,14 @@ inline void nax_frag_store_dequant(const thread int32_t *src, device half *dst,
 // ── Generic GEMM kernel (B is [N, K], transpose_b) ─────────────
 // Computes: C[M,N] = A[M,K] × B[N,K]^T
 // A is [M, K] row-major, B is [N, K] row-major
-// B fragments loaded as [N_tile, K_tile] and hardware transposes via transpose_b=true
+// B fragments loaded as [N_tile, K_tile] and hardware transposes via
+// transpose_b=true
 template <int BM, int BN, int BK, int SK, int WM, int WN>
 void w8a8_gemm_impl(const device int8_t *A, const device int8_t *B,
                     device half *C, uint M, uint N, uint K,
                     const device float *scale_a, const device float *scale_w,
-                    uint swizzle_log, uint tiles_m, uint tiles_n, uint2 tgid,
-                    uint sgid, uint lid) {
+                    const device half *bias, uint swizzle_log, uint tiles_m,
+                    uint tiles_n, uint2 tgid, uint sgid, uint lid) {
   constexpr int SM = BM / WM;   // 32
   constexpr int SN = BN / WN;   // 32
   constexpr short TM = SM / 16; // 2
@@ -142,7 +145,7 @@ void w8a8_gemm_impl(const device int8_t *A, const device int8_t *B,
 
     for (int kk1 = 0; kk1 < BK; kk1 += SK) {
       int8_t a_frags[TM][TK][kElemsPerFrag];
-      int8_t b_frags[TN][TK][kElemsPerFrag];  // [N_tile, K_tile] for transpose_b
+      int8_t b_frags[TN][TK][kElemsPerFrag]; // [N_tile, K_tile] for transpose_b
       volatile int compiler_barrier;
 
       // Load A fragments: [M_tile, K_tile], ld=K
@@ -187,7 +190,7 @@ void w8a8_gemm_impl(const device int8_t *A, const device int8_t *B,
     }
 
     sg_A += BK;
-    sg_B += BK;  // B is [N, K]: K advances by BK along columns
+    sg_B += BK; // B is [N, K]: K advances by BK along columns
   }
 
   // ── Remainder K ─────────────────────────────────────────────
@@ -248,7 +251,7 @@ void w8a8_gemm_impl(const device int8_t *A, const device int8_t *B,
     for (short nn = 0; nn < TN; nn++) {
       nax_frag_store_dequant(c_frags[mm * TN + nn], D, int(N), sc,
                              short(mm * 16), short(nn * 16), M, N, m_base,
-                             n_base, scale_a, scale_w);
+                             n_base, scale_a, scale_w, bias);
     }
   }
 }
@@ -265,12 +268,13 @@ kernel void w8a8_matmul_fused_dequant(
     const device float *scale_w [[buffer(7)]],
     constant uint &swizzle_log [[buffer(8)]],
     constant uint &tiles_m [[buffer(9)]], constant uint &tiles_n [[buffer(10)]],
+    const device half *bias [[buffer(11)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint sgid [[simdgroup_index_in_threadgroup]],
     uint lid [[thread_index_in_simdgroup]]) {
   w8a8_gemm_impl<128, 128, 512, 32, 4, 4>(A, B, C, M, N, K, scale_a, scale_w,
-                                          swizzle_log, tiles_m, tiles_n, tgid,
-                                          sgid, lid);
+                                          bias, swizzle_log, tiles_m, tiles_n,
+                                          tgid, sgid, lid);
 }
 
 kernel void w8a8_matmul_fused_dequant_small(
@@ -281,12 +285,13 @@ kernel void w8a8_matmul_fused_dequant_small(
     const device float *scale_w [[buffer(7)]],
     constant uint &swizzle_log [[buffer(8)]],
     constant uint &tiles_m [[buffer(9)]], constant uint &tiles_n [[buffer(10)]],
+    const device half *bias [[buffer(11)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint sgid [[simdgroup_index_in_threadgroup]],
     uint lid [[thread_index_in_simdgroup]]) {
   w8a8_gemm_impl<32, 128, 512, 32, 1, 4>(A, B, C, M, N, K, scale_a, scale_w,
-                                         swizzle_log, tiles_m, tiles_n, tgid,
-                                         sgid, lid);
+                                         bias, swizzle_log, tiles_m, tiles_n,
+                                         tgid, sgid, lid);
 }
 
 // ============================================================
@@ -306,7 +311,9 @@ void w8a8_gemm_int32_impl(const device int8_t *A, const device int8_t *B,
 
   uint tid_y = (tgid.y << swizzle_log) + (tgid.x & ((1u << swizzle_log) - 1u));
   uint tid_x = tgid.x >> swizzle_log;
-  if (tid_x >= tiles_n || tid_y >= tiles_m) return;
+  if (tid_x >= tiles_n || tid_y >= tiles_m) {
+    return;
+  }
 
   short2 sc = nax_get_coord(ushort(lid));
   uint sg_row = sgid / WN;
@@ -322,14 +329,20 @@ void w8a8_gemm_int32_impl(const device int8_t *A, const device int8_t *B,
       mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
   mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> gemm_op;
 
-  auto ct_a = gemm_op.get_left_input_cooperative_tensor<int8_t, int8_t, int32_t>();
-  auto ct_b = gemm_op.get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
-  auto ct_c = gemm_op.get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), int32_t>();
+  auto ct_a =
+      gemm_op.get_left_input_cooperative_tensor<int8_t, int8_t, int32_t>();
+  auto ct_b =
+      gemm_op.get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
+  auto ct_c =
+      gemm_op.get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b),
+                                                 int32_t>();
 
   int32_t c_frags[TM * TN][kElemsPerFrag];
-  for (int f = 0; f < TM * TN; f++)
-    for (int i = 0; i < kElemsPerFrag; i++)
+  for (int f = 0; f < TM * TN; f++) {
+    for (int i = 0; i < kElemsPerFrag; i++) {
       c_frags[f][i] = 0;
+    }
+  }
 
   int gemm_k_iters = int(K) / BK;
   for (int kk0 = 0; kk0 < gemm_k_iters; kk0++) {
@@ -339,21 +352,29 @@ void w8a8_gemm_int32_impl(const device int8_t *A, const device int8_t *B,
       int8_t b_frags[TN][TK][kElemsPerFrag];
       volatile int compiler_barrier;
 
-      for (short mm = 0; mm < TM; mm++)
-        for (short kk = 0; kk < TK; kk++)
-          nax_frag_load(a_frags[mm][kk], sg_A + kk1, int(K), sc, short(mm*16), short(kk*16));
+      for (short mm = 0; mm < TM; mm++) {
+        for (short kk = 0; kk < TK; kk++) {
+          nax_frag_load(a_frags[mm][kk], sg_A + kk1, int(K), sc, short(mm * 16),
+                        short(kk * 16));
+        }
+      }
 
-      for (short nn = 0; nn < TN; nn++)
-        for (short kk = 0; kk < TK; kk++)
-          nax_frag_load(b_frags[nn][kk], sg_B + kk1, int(K), sc, short(nn*16), short(kk*16));
+      for (short nn = 0; nn < TN; nn++) {
+        for (short kk = 0; kk < TK; kk++) {
+          nax_frag_load(b_frags[nn][kk], sg_B + kk1, int(K), sc, short(nn * 16),
+                        short(kk * 16));
+        }
+      }
 
       for (short mm = 0; mm < TM; mm++) {
         for (short nn = 0; nn < TN; nn += 2) {
           for (short kk = 0; kk < TK; kk++) {
-            for (short i = 0; i < kElemsPerFrag; i++) ct_a[i] = a_frags[mm][kk][i];
+            for (short i = 0; i < kElemsPerFrag; i++) {
+              ct_a[i] = a_frags[mm][kk][i];
+            }
             for (short i = 0; i < kElemsPerFrag; i++) {
               ct_b[i] = b_frags[nn][kk][i];
-              ct_b[kElemsPerFrag + i] = b_frags[nn+1][kk][i];
+              ct_b[kElemsPerFrag + i] = b_frags[nn + 1][kk][i];
             }
             short c0 = mm * TN + nn, c1 = c0 + 1;
             for (short i = 0; i < kElemsPerFrag; i++) {
@@ -386,19 +407,24 @@ void w8a8_gemm_int32_impl(const device int8_t *A, const device int8_t *B,
       for (short i = 0; i < 2; i++)
         for (short j = 0; j < kElemCols; j++) {
           short ki = short(sc.x + j);
-          a_frag[mm][i * kElemCols + j] = (ki < psk) ? ptr[(i * kElemRowsJump) * K + j] : int8_t(0);
+          a_frag[mm][i * kElemCols + j] =
+              (ki < psk) ? ptr[(i * kElemRowsJump) * K + j] : int8_t(0);
         }
     }
     for (short nn = 0; nn < TN; nn++) {
       const device int8_t *ptr = sg_B + kk1 + (sc.y + nn * 16) * K + sc.x;
-      for (short i = 0; i < 2; i++)
+      for (short i = 0; i < 2; i++) {
         for (short j = 0; j < kElemCols; j++) {
           short ki = short(sc.x + j);
-          b_frag[nn][i * kElemCols + j] = (ki < psk) ? ptr[(i * kElemRowsJump) * K + j] : int8_t(0);
+          b_frag[nn][i * kElemCols + j] =
+              (ki < psk) ? ptr[(i * kElemRowsJump) * K + j] : int8_t(0);
         }
+      }
     }
     for (short mm = 0; mm < TM; mm++) {
-      for (short i = 0; i < kElemsPerFrag; i++) ct_a[i] = a_frag[mm][i];
+      for (short i = 0; i < kElemsPerFrag; i++) {
+        ct_a[i] = a_frag[mm][i];
+      }
       for (short i = 0; i < kElemsPerFrag; i++) {
         ct_b[i] = b_frag[0][i];
         ct_b[kElemsPerFrag + i] = b_frag[1][i];
@@ -418,9 +444,12 @@ void w8a8_gemm_int32_impl(const device int8_t *A, const device int8_t *B,
 
   // Store raw INT32
   device int32_t *D = C + m_base * N + n_base;
-  for (short mm = 0; mm < TM; mm++)
-    for (short nn = 0; nn < TN; nn++)
-      nax_frag_store_int32(c_frags[mm * TN + nn], D, int(N), sc, short(mm*16), short(nn*16), M, N, m_base, n_base);
+  for (short mm = 0; mm < TM; mm++) {
+    for (short nn = 0; nn < TN; nn++) {
+      nax_frag_store_int32(c_frags[mm * TN + nn], D, int(N), sc, short(mm * 16),
+                           short(nn * 16), M, N, m_base, n_base);
+    }
+  }
 }
 
 // ============================================================

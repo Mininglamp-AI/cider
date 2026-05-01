@@ -1,5 +1,5 @@
 // W8A8 Linear as mlx Custom Primitive.
-// Dispatches quantize + INT8 matmul via mlx's CommandEncoder.
+// Dispatches quantize + INT8 matmul (prefill) or FP MV (decode) via mlx's CommandEncoder.
 
 #pragma once
 
@@ -14,16 +14,16 @@ namespace MTL {
 class ComputePipelineState;
 }
 
-namespace w8a8_mlx {
+namespace cider {
 
 namespace mx = mlx::core;
 
 // ── Custom Primitive ─────────────────────────────────────────────
-// Inputs: [x(M,K) float16, w(K,N) int8, scale_w(N) float32]
+// Inputs: [x(M,K) float16, w(N,K) int8, scale_w(N) float32, bias(N) float16]
 // Output: [y(M,N) float16]
 //
-// Weight layout is [K, N] (input_dims, output_dims) — matching the
-// kernel's native B matrix layout and W8A8Linear.weight convention.
+// M > 1: quantize activation + INT8 GEMM (prefill)
+// M == 1: FP activation × dequant weight MV (decode)
 class W8A8Linear : public mx::Primitive {
  public:
   explicit W8A8Linear(mx::Stream stream, const std::string& kernel_dir)
@@ -83,10 +83,11 @@ class Int8MatMulInt32 : public mx::Primitive {
 };
 
 // ── Public API ───────────────────────────────────────────────────
-mx::array w8a8_linear(
+mx::array perchannel_linear(
     const mx::array& x,       // [M, K] float16
-    const mx::array& w,       // [K, N] int8 (kernel-native layout)
+    const mx::array& w,       // [N, K] int8
     const mx::array& scale_w, // [N] float32
+    const mx::array& bias,    // [N] float16
     const std::string& kernel_dir,
     mx::StreamOrDevice s = {});
 
@@ -98,4 +99,4 @@ mx::array int8_matmul_int32(
     const std::string& kernel_dir,
     mx::StreamOrDevice s = {});
 
-}  // namespace w8a8_mlx
+}  // namespace cider
