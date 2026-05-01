@@ -14,10 +14,10 @@ import argparse
 import time
 import threading
 from PIL import Image
-from core_infer import HMInference, ErrorCode
+from .core_infer import HMInference, ErrorCode
 import logging
 from io import BytesIO
-from config import load_config, get_config
+from .config import load_config, get_config
 from pathlib import Path
 
 # ============= Pydantic Models for OpenAI Compatible API =============

@@ -16,7 +16,7 @@ from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_vlm.models import cache
 from mlx_vlm.utils import StoppingCriteria, ThinkingBudgetCriteria, prepare_inputs
 import time
-from code_def import CustomGenerationResult, ErrorCode
+from .code_def import CustomGenerationResult, ErrorCode
 from transformers import PreTrainedTokenizer
 import numpy as np
 
