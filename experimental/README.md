@@ -1,6 +1,8 @@
 # ANE Split — ANE+GPU Tensor Parallelism for Prefill Acceleration
+*Status: experimental research prototype. Uses private ANE APIs and is not part of Cider's stable inference path.*
 
-Split each linear layer's GEMM along output channels: **ANE** and  **GPU** computes running concurrently. This exploits the idle Apple Neural Engine during LLM inference to try to speed up prefill without any accuracy loss.
+Split each linear layer's GEMM along output channels: **ANE** and  **GPU** computes running concurrently. This explores whether the otherwise idle Apple Neural Engine can help accelerate prefill, with minimal degradation observed in our current tests.
+
 
 > **Platform:** Apple M4 (tested). M5 ANE API changes may cause failures — not yet validated.
 
