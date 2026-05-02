@@ -1,6 +1,6 @@
 # cider
 
-Cider is developed on top of MLX for macOS. It provides online activation quantization operators absent in MLX, with custom int-matmul kernels built as MLX custom primitives supporting full lazy evaluation. It also extends mlx_vlm by fixing multiple bugs and adding on-device inference services.
+Cider is developed on top of MLX for macOS. It provides online activation quantization operators absent in MLX, with custom int-matmul kernels built as MLX custom primitives supporting full lazy evaluation. It also includes service-side extensions and non-intrusive compatibility patches for mlx_vlm (validated on mlx_vlm 0.4.3), including fixes for Qwen3-VL multi-image inference issues related to RoPE position handling and chunked prefill. 
 
 ## Conditional Compilation (M4 / M5)
 
