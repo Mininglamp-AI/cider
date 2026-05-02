@@ -21,8 +21,8 @@ CIDER_FORCE_BUILD=0 pip install -e .   # Force skip
 
 | Mode | Weights | Activations | Compute Path | Status |
 |------|---------|-------------|--------------|--------|
-| **W8A8** | INT8 symmetric | INT8 per-token | TensorOps matmul2d | ✅ Stable |
-| **W4A8** | INT4 packed (uint8) | INT8 per-token | Unpack→TensorOps | ✅ Stable |
+| **W8A8** | INT8 symmetric | INT8 per-token | TensorOps matmul2d | ✅ Implemented |
+| **W4A8** | INT4 packed (uint8) | INT8 per-token | Unpack→TensorOps | ✅ Implemented |
 | W4A16 | — | — | MLX built-in | Baseline |
 | W8A16 | — | — | MLX built-in | Baseline |
 
@@ -30,17 +30,15 @@ CIDER_FORCE_BUILD=0 pip install -e .   # Force skip
 
 MLX's quantization is **weight-only**: QuantizedLinear dequantizes weights to FP16 and uses FP16 GEMM. While MLX's Steel NAX templates are generic enough to be instantiated with INT8 types (and would achieve identical raw matmul throughput — [see our transparent benchmark](benchmarks/mlx_native/cider_vs_mlx_int8.md)), MLX does not provide the quantization/dequantization pipeline needed for actual W8A8 inference. Cider fills this gap with fused quantize-matmul-dequant primitives.
 
-This SDK provides true INT8 activation quantization + INT8 TensorOps compute, which:
-- **W8A8**: **1.4x–2.2x** faster prefill depending on batch size
-- **W4A8**: Half the weight memory of W8A8, competitive with MLX W4A16 at batch sizes ≥ 16
+This SDK implements online INT8 activation quantization and INT8 TensorOps-based compute for the supported inference paths. 
 
 ### W8A8 Quantization Granularity
 
 | Granularity | Description | Speed | Precision |
 |-------------|-------------|-------|-----------|
 | **Per-channel** | One scale per output channel | Fastest (1.8x prefill) | Slightly lower |
-| **Per-group (gs=128)** | One scale per 128 elements | Fast (1.5x prefill) | Near-lossless |
-| **Per-group (gs=64)** | One scale per 64 elements | Moderate (1.3x prefill) | Near-lossless |
+| **Per-group (gs=128)** | One scale per 128 elements | Fast (1.5x prefill) | Better precision retention |
+| **Per-group (gs=64)** | One scale per 64 elements | Moderate (1.3x prefill) | Higher precision |
 
 ## Performance (Apple M5 Pro)
 
@@ -406,7 +404,8 @@ Auto-selected based on M. L2 cache swizzle dispatch included.
 
 ## ANE+GPU Heterogeneous Tensor Parallelism (experimental)
 
-We found that during inference on Mac, only two hardware computing units—GPU and CPU—were utilized, while the ANE (Apple Neural Engine) computing unit on Mac remained idle. We identified this as a potential optimization opportunity. Inspired by [maderix/ANE](https://github.com/maderix/ANE), we conducted experimental work on a hybrid ANE+GPU inference mode. Currently, we apply this approach to tensor parallel computing. On the M4 chip, during synchronous-only forward inference (MLX natively uses a technique called lazy evaluation, which reduces synchronization overhead; in end-to-end testing, the hybrid inference currently shows no advantage, mainly because we have not yet implemented this using MLX's lazy evaluation—this remains future work), we observed approximately **3%~16%** performance improvement compared to pure GPU inference under synchronize pipeline. We believe that GPU+ANE hybrid inference should have even greater potential for improvement.
+We found that during inference on Mac, only two hardware computing units—GPU and CPU—were utilized, while the ANE (Apple Neural Engine) computing unit on Mac remained idle. We identified this as a potential optimization opportunity. Inspired by [maderix/ANE](https://github.com/maderix/ANE), we conducted experimental work on a hybrid ANE+GPU inference mode. Currently, we apply this approach to tensor parallel computing. On the M4 chip, during synchronous-only forward inference (MLX natively uses a technique called lazy evaluation, which reduces synchronization overhead; in end-to-end testing, the hybrid inference currently shows no advantage, mainly because we have not yet implemented this using MLX's lazy evaluation—this remains future work), we observed approximately **3%~16%** performance improvement compared to pure GPU inference under synchronize pipeline. This remains exploratory work, and end-to-end gains are currently limited by the lack of a lazy-evaluation-compatible implementation.
+
 
 During LLM prefill, the GPU's matrix units are fully occupied — but the **Apple Neural Engine sits completely idle**. ANE Split exploits this by splitting each linear layer's GEMM along output channels:
 
@@ -423,7 +422,8 @@ This is a form of **heterogeneous tensor parallelism** — not data parallelism,
 | 512 | 639.9 ms | **615.9 ms** | **1.039×** |
 | 1024 | 1348.6 ms | **1156.9 ms** | **1.17×** |
 
-Accuracy: cos ≈ 1.0, top-1 match = 100%.
+In the tested benchmark cases, cosine similarity was close to 1.0 and top-1 token agreement was 100%.
+
 
 ### Key Design Choices
 
