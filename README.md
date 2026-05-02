@@ -186,7 +186,8 @@ else:
 **Important**
 When quantizing Vision-Language Models (VLMs), the vision transformer (ViT) is generally not replaced. Directly using convert_model will quantize the vision model's linear layers as well, which typically causes accuracy drop. For VLMs, we recommend calling convert_model(model.language_model) to apply existing quantization methods like GPTQ, SmoothQuant, and AWQ to the language model only.
 
-Works with **any MLX model** — Qwen, Llama, Mistral, etc. Automatically handles float16 and bfloat16.
+Tested on selected MLX transformer models, including Qwen3, Qwen3-VL and Llama3 families. Other architectures may require adaptation.
+
 
 ### Layer-level API
 
@@ -271,7 +272,7 @@ cider/
 │   └── smoothquant.py                # SmoothQuant calibration
 ├── examples/
 │   └── basic_usage.py
-├── vlm_service/           # OpenAI-compatible VLM inference server
+├── vlm_service/           # OpenAI-style VLM inference server
 │   ├── server.py             # FastAPI server (streaming + non-streaming)
 │   ├── core_infer.py         # HMInference engine (singleton)
 │   ├── custom_qwen3vl.py     # Custom Qwen3-VL generation loop
@@ -293,7 +294,7 @@ cider/
 
 ## VLM Inference Service
 
-`vlm_service/` provides a ready-to-use **OpenAI-compatible** VLM inference server with W8A8 acceleration.
+`vlm_service/` provides a ready-to-use **OpenAI-style** VLM inference server with W8A8 acceleration.
 
 ### Quick Start
 
@@ -324,7 +325,7 @@ cd vlm_service
 python server.py --config ../config/config.yaml
 ```
 
-3. **Send requests** (OpenAI-compatible API):
+3. **Send requests** (OpenAI-style API):
 
 ```bash
 # Text-only
@@ -479,7 +480,8 @@ python tools/eval_ppl_all.py --num-samples 50
 
 Multimodal Team, Mininglamp Technology
 
-Please refer to wangshuo.e@mininglamp.com if you find any issue.
+For bug reports, feature requests, and usage questions, please open an issue in this repository.
+
 
 
 ## Citation
