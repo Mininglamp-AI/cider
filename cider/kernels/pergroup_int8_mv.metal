@@ -5,14 +5,9 @@
 // Symmetric quantization: new_bias is always zero, skip correction.
 //
 // Formula:
-//   y[n] = Σ_g { scale_w[n,g] * dot_g(w[n], x) } + bias[n]
+//   y[n] = Sigma_g { scale_w[g,n] * dot_g(w[n], x) } + bias[n]
 //
-// Key optimizations:
-//   1. VPT=8 (doubles bandwidth utilization vs V3)
-//   2. NUM_SIMDGROUPS=2 (matches MLX qmv_fast)
-//   3. NO x_sum / new_bias computation (symmetric quantization)
-//   4. Pointer-advance pattern (minimal index math)
-//   5. 2x uint32 load for 8 weights (sequential)
+// V2: scale_w transposed [num_groups, N] for coalesced access
 // ============================================================
 
 #include <metal_stdlib>
@@ -29,8 +24,8 @@ inline void pergroup_mv_v5_impl(
     const device half *x,
     const device int8_t *W,
     device half *y,
-    const device float *scale_w,
-    const device float *new_bias [[maybe_unused]], // kept for buffer layout compat
+    const device float *scale_w,    // [num_groups, N] transposed
+    const device float *new_bias [[maybe_unused]],
     constant uint &N, constant uint &K,
     const device half *bias,
     uint tgid [[threadgroup_position_in_grid]],
@@ -59,7 +54,7 @@ inline void pergroup_mv_v5_impl(
             xv[i] = float(xp[i]);
         }
 
-        // Group index for this thread's data
+        // Group index for this thread data
         uint g = (k + lid * VPT) / GROUP_SIZE;
 
         for (int r = 0; r < RESULTS_PER_SG; r++) {
@@ -82,8 +77,8 @@ inline void pergroup_mv_v5_impl(
             float dot = xv[0]*b0 + xv[1]*b1 + xv[2]*b2 + xv[3]*b3
                       + xv[4]*b4 + xv[5]*b5 + xv[6]*b6 + xv[7]*b7;
 
-            // Symmetric: only scale, no correction
-            float sw = scale_w[n_idx * num_groups + g];
+            // Transposed: scale_w[g * N + n_idx] (coalesced for adjacent n)
+            float sw = scale_w[g * N + (out_row + r)];
             result[r] += sw * dot;
         }
 

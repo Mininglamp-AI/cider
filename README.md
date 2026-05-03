@@ -37,30 +37,50 @@ This SDK implements online INT8 activation quantization and INT8 TensorOps-based
 | Granularity | Description | Speed | Precision |
 |-------------|-------------|-------|-----------|
 | **Per-channel** | One scale per output channel | Fastest (1.8x prefill) | Slightly lower |
-| **Per-group (gs=128)** | One scale per 128 elements | Fast (1.5x prefill) | Better precision retention |
+| **Per-group (gs=128)** | One scale per 128 elements | Fast (1.5x prefill) | Moderate precision retention |
 | **Per-group (gs=64)** | One scale per 64 elements | Moderate (1.3x prefill) | Higher precision |
 
 ## Performance (Apple M5 Pro)
 
-### End-to-End VLM (Qwen3-VL-2B, Real Trajectory)
+### Individual Operator Latency 
 
-| Metric | FP16 | W8A16 (MLX) | **W8A8 (Cider)** |
-|--------|------|-------------|------------------|
-| Decode (tok/s) | 70 | 100 | **95** |
-| Prefill (tok/s) | 2900 | 1900 | **2100** |
-| Overall | baseline | 1.0x | **1.08x faster** |
+Shape [N=10240, K=2560]
+| M |   PC(ms) |  PG(ms)  |  w8a16  |  w4a16 |   PC/w8  | PC/w4  | PG/w8  | PG/w4|
+|-----|------|------|-----|-----|-----|------|-----|----|
+| 1 |   0.27ms |   0.26ms |  0.26ms |  0.18ms |  0.96x | 0.67x | 0.99x | 0.69x |
+|128 |   0.34ms  | 0.39ms |  0.49ms |  0.44ms |  1.43x | 1.28x  | 1.26x |  1.13x |
+|1024 |   1.23ms |  1.52ms  | 2.24ms  | 2.04ms |  1.82x  | 1.66x | 1.47x | 1.34x|
+|4096 |   4.41ms |  5.65ms |  8.12ms |  7.72ms |  1.84x |  1.75x | 1.44x  | 1.37x |
+|8192 |   8.71ms |  11.40ms |  16.23ms | 15.09ms |  1.86x | 1.73x | 1.42x | 1.32x|
 
-W8A8 decode is within 5% of MLX W8A16. Total end-to-end (prefill + decode) is 8% faster than W8A16 and 10% faster than FP16.
 
-### Individual Operator Latency (4096×4096)
+Shape [N=2560, K=10240]
+| M |   PC(ms)  | PG(ms)   | w8a16  |  w4a16 |   PC/w8  | PC/w4  | PG/w8  | PG/w4 |
+|--------|------|--------|-------| ---|--------|------|-------------|------------------|
+| 1 |   0.25ms |  0.26ms |  0.26ms  | 0.20ms |  1.03x | 0.78x | 0.98x | 0.75x |
+|128 |   0.39ms |  0.41ms |  0.55ms |  0.46ms |  1.43x | 1.19x | 1.35x | 1.12x |
+| 1024 |   1.31ms |  1.65ms |  2.35ms  | 2.14ms |  1.80x  | 1.64x | 1.43x | 1.30x |
+| 4096 |   5.37ms  | 6.79ms  | 8.54ms |  8.04ms |  1.59x | 1.50x | 1.26x | 1.18x |
+| 8192 |  10.97ms | 12.94ms | 17.28ms | 16.23ms |  1.58x | 1.48x | 1.34x | 1.25x | 
 
-| M | W8A8 | W4A8 | MLX W4A16 | W8A8 vs W4A16 |
-|---|------|------|-----------|---------------|
-| 1 | 0.47ms | 0.52ms | 0.21ms | 0.44x |
-| 16 | 0.23ms | 0.32ms | 0.34ms | **1.48x** |
-| 64 | 0.24ms | 0.40ms | 0.53ms | **2.21x** |
-| 128 | 0.29ms | 0.47ms | 0.40ms | **1.38x** |
-| 256 | 0.41ms | 0.69ms | 0.71ms | **1.73x** |
+### End-to-End VLM 
+
+**Qwen3-VL-2B**
+
+| Prompt Tokens | FP16 Prefill (tok/s) | W8A16 Prefill (tok/s) | **W8A8 PC Prefill (tok/s)** | FP16 Decode (tok/s) | W8A16 Decode (tok/s) | **W8A8 PC Decode (tok/s)** |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 1334 | 3010 | 2065 | **3242** | 70 | 107 | **104** |
+| 2393 | 2868 | 1847 | **2983** | 69 | 97 | **100** |
+| 3455 | 2777 | 1741 | **2796** | 66 | 90 | **95** |
+
+**Qwen3-VL-4B**
+
+ Prompt Tokens | FP16 Prefill (tok/s) | W8A16 Prefill (tok/s) | **W8A8 PC Prefill (tok/s)** | FP16 Decode (tok/s) | W8A16 Decode (tok/s) | **W8A8 PC Decode (tok/s)** |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 1334 | 1884 | 1786 | **2186** | 32 | **56** | 54 |
+| 2393 | 1815 | 1700 | **2028** | 31 | **55** | 52 |
+| 3455 | 1755 | 1603 | **1881** | 30 | **52** | 49 |
+
 
 ### LLM Quantization: Precision vs. Speed Comparison
 
@@ -170,7 +190,7 @@ On M4 and below, only the Python package is installed (no compilation errors).
 ```python
 from cider import convert_model, is_available
 
-model, proc = load("path/to/model")  # Any MLX model
+model, proc = load("path/to/model")
 
 if is_available():
     convert_model(model)

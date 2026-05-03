@@ -111,9 +111,9 @@ def main():
     mx.random.seed(123)
     
     configs = [
-        ("Baseline FP16", FP16_MODEL, None),
-        ("Baseline W8A16 (MLX native)", W8A16_MODEL, None),
-        ("Cider W8A8 per-channel", W8A16_MODEL, 0),
+        # ("Baseline FP16", FP16_MODEL, None),
+        # ("Baseline W8A16 (MLX native)", W8A16_MODEL, None),
+        # ("Cider W8A8 per-channel", W8A16_MODEL, 0),
         ("Cider W8A8 per-group(gs=64)", W8A16_MODEL, 64),
         ("Cider W8A8 per-group(gs=128)", W8A16_MODEL, 128),
     ]

@@ -3,26 +3,26 @@
 // Target: Apple M5 (G17G), Metal 4
 //
 // Weight layout: B is [N, K] int8 (per-group symmetric quantized)
-//   - scales_w: [N, num_groups] float32
+//   - scales_w: [num_groups, N] float32 (TRANSPOSED for coalesced access)
 //   - scales_a: [M] float32 (per-token activation scales)
 //
-// Computes: C[m,n] = scale_a[m] * Σ_g { float(dot_int32[m,n,g]) * scale_w[n,g]
-// }
-//   where dot_int32[m,n,g] = Σ_{k in group g} A_int8[m,k] * B_int8[n,k]
+// Computes: C[m,n] = scale_a[m] * Sigma_g { float(dot_int32[m,n,g]) * scale_w[g,n] }
+//   where dot_int32[m,n,g] = Sigma_{k in group g} A_int8[m,k] * B_int8[n,k]
 //
 // Supported group_size: 64, 128, 256
+// V2: scale_w transposed [num_groups, N] for coalesced SIMD access
 // ============================================================
 
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_stdlib>
 using namespace metal;
 
-// ── NAXFrag layout constants ────────────────────────────────────
-constant constexpr short kEPF = 8; // elements per fragment
-constant constexpr short kEC = 4;  // element columns
-constant constexpr short kERJ = 8; // element row jump
+// -- NAXFrag layout constants
+constant constexpr short kEPF = 8;
+constant constexpr short kEC = 4;
+constant constexpr short kERJ = 8;
 
-// ── NAXFrag coordinate mapping ──────────────────────────────────
+// -- NAXFrag coordinate mapping
 inline short2 nax_coord(ushort lid) {
   short qid = short(lid >> 2);
   short fm = ((qid & 4) | ((short(lid) >> 1) & 3));
@@ -30,7 +30,7 @@ inline short2 nax_coord(ushort lid) {
   return short2{fn, fm};
 }
 
-// ── Fragment load: device → register ────────────────────────────
+// -- Fragment load: device -> register
 template <typename T>
 inline void frag_load(thread T *dst, const device T *src, int ld, short2 sc,
                       short off_m = 0, short off_n = 0) {
@@ -42,12 +42,12 @@ inline void frag_load(thread T *dst, const device T *src, int ld, short2 sc,
   }
 }
 
-// ── Per-group GEMM implementation ───────────────────────────────
+// -- Per-group GEMM implementation (scale_w transposed: [num_groups, N])
 template <int BM, int BN, int BK, int SK, int WM, int WN>
 void pergroup_gemm_impl(const device int8_t *A, const device int8_t *B,
                         device half *C, uint M, uint N, uint K,
                         const device float *scale_a,
-                        const device float *scale_w, // [N, num_groups]
+                        const device float *scale_w, // [num_groups, N] transposed
                         const device half *bias,     // [N] half
                         uint swizzle_log, uint tiles_m, uint tiles_n,
                         uint2 tgid, uint sgid, uint lid) {
@@ -95,7 +95,7 @@ void pergroup_gemm_impl(const device int8_t *A, const device int8_t *B,
     }
   }
 
-  // ── Main K loop: one iteration per group ────────────────────
+  // -- Main K loop: one iteration per group
   for (uint g = 0; g < num_groups; g++) {
     // INT32 accumulator for this group
     int32_t c_frags[TM * TN][kEPF];
@@ -149,14 +149,15 @@ void pergroup_gemm_impl(const device int8_t *A, const device int8_t *B,
       }
     }
 
-    // ── Flush: int32 → float * scale_w[n, g] → accumulate ──
+    // -- Flush: int32 * scale_w[g, n] -> accumulate
+    // scale_w is [num_groups, N]: scale_w[g * N + n_idx] is coalesced for adjacent n
     for (short mm = 0; mm < TM; mm++) {
       for (short nn = 0; nn < TN; nn++) {
         short fidx = mm * TN + nn;
         float sw[kEC];
         for (short j = 0; j < kEC; j++) {
           uint n_idx = n_base + uint(sc.x) + uint(nn * 16) + uint(j);
-          sw[j] = (n_idx < N) ? scale_w[n_idx * num_groups + g] : 0.0f;
+          sw[j] = (n_idx < N) ? scale_w[g * N + n_idx] : 0.0f;
         }
         for (short i = 0; i < 2; i++) {
           for (short j = 0; j < kEC; j++) {
@@ -170,7 +171,7 @@ void pergroup_gemm_impl(const device int8_t *A, const device int8_t *B,
     sg_B += BK;
   }
 
-  // ── Store: acc * scale_a + bias → half ─────────────────────────────
+  // -- Store: acc * scale_a + bias -> half
   device half *D = C + m_base * N + n_base;
   for (short mm = 0; mm < TM; mm++) {
     for (short nn = 0; nn < TN; nn++) {

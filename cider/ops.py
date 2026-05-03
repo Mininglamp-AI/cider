@@ -181,7 +181,7 @@ def pergroup_linear(
     Args:
         x: Input activations [M, K] float16 or bfloat16.
         w: INT8 weights [N, K] int8 (per-group symmetric quantized).
-        scale_w: Per-group weight scales [N, num_groups] float32.
+        scale_w: Per-group weight scales [num_groups, N] float32 (physically transposed for coalesced GPU access).
         group_size: Group size (64, 128, or 256).
         bias: Optional bias [N] float16. Default zeros.
         stream: Optional MLX stream.
@@ -191,7 +191,7 @@ def pergroup_linear(
     """
     ext = _load_ext()
     N = w.shape[0]
-    num_groups = scale_w.shape[1] if scale_w.ndim == 2 else 1
+    num_groups = scale_w.shape[0] if scale_w.ndim == 2 else 1  # scale_w is [num_groups, N]
     if bias is None:
         bias = mx.zeros((N,), dtype=mx.float16)
     if new_bias is None:
@@ -201,6 +201,8 @@ def pergroup_linear(
         new_bias = _get_shared_new_bias_placeholder(N, num_groups)
     out_dtype = x.dtype
     kw = {"stream": stream} if stream is not None else {}
+    # scale_w layout: [num_groups, N] physically contiguous. Kernel indexes as scale_w[g * N + n].
+
     result = ext.pergroup_linear(x, w, scale_w, bias, new_bias, group_size, kernel_dir(), **kw)
     if out_dtype != mx.float16:
         result = result.astype(out_dtype, **kw)

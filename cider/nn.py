@@ -74,7 +74,7 @@ class CiderLinear(nn.Module):
     def __init__(
         self,
         w_int8: mx.array,       # [N, K] int8
-        scale_w: mx.array,      # per-channel: [N], per-group: [N, num_groups]
+        scale_w: mx.array,      # per-channel: [N], per-group: [num_groups, N] (row-major contiguous)
         group_size: int,        # 0 = per-channel, 64/128/256 = per-group
         in_features: int,
         out_features: int,
@@ -82,6 +82,10 @@ class CiderLinear(nn.Module):
     ):
         super().__init__()
         self.w_int8 = w_int8
+        # Per-group: physically transpose scale_w from [N, num_groups] to [num_groups, N]
+        # for coalesced SIMD access in Metal kernels.
+        # scale_w for per-group must already be [num_groups, N] physically contiguous.
+        # This is ensured by from_float() and convert.py at construction time (numpy transpose).
         self.scale_w = scale_w
         self.group_size = group_size
         self._in_features = in_features
@@ -159,7 +163,7 @@ class CiderLinear(nn.Module):
                 w_int8_np, scale_np = _symmetric_quantize_pergroup(w_np, tgs)
                 return CiderLinear(
                     w_int8=mx.array(w_int8_np),
-                    scale_w=mx.array(scale_np),
+                    scale_w=mx.array(scale_np.T.copy()),  # [N,ng] -> [ng,N] contiguous
                     group_size=tgs,
                     in_features=in_f,
                     out_features=out_f,
@@ -180,7 +184,7 @@ class CiderLinear(nn.Module):
 
             return CiderLinear(
                 w_int8=mx.array(w_int8_np),
-                scale_w=mx.array(scale_np),
+                scale_w=mx.array(scale_np.T.copy() if tgs > 0 else scale_np),  # [N,ng] -> [ng,N]
                 group_size=tgs,
                 in_features=in_f,
                 out_features=out_f,
