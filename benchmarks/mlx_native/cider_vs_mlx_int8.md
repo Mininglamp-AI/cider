@@ -1,20 +1,24 @@
 # Cider W8A8 Kernel vs MLX INT8 GEMM: A Transparent Comparison
 
 
-**MLX's Steel NAX GEMM templates are fully generic** — they can be instantiated with `<int8_t, int8_t, int32_t>` to produce a working INT8×INT8→INT32 matmul using the same `mpp::tensor_ops::matmul2d` hardware instruction as Cider. At the raw matmul level, both kernels achieve **comparable throughput** (within 2–5% across all tested sizes).
+MLX's Steel NAX GEMM templates appear generic enough at the shader level to support `<int8_t, int8_t, int32_t>` instantiations. In our standalone test, an MLX-style INT8×INT8→INT32 kernel can be built on the same `mpp::tensor_ops::matmul2d` TensorOps instruction used by Cider. At the raw matmul level, both kernels achieve **comparable throughput** (within 2–5% across all tested sizes).
 
-Cider's contribution is **not** a novel matmul kernel. It is the **first complete W8A8 inference pipeline on Apple Silicon** — and the reason it matters is simple:
+Cider's contribution is **not** a novel matmul kernel. It is an end-to-end W8A8 inference pipeline for Apple Silicon, combining online activation quantization, INT8 TensorOps matmul, and dequantization in a usable MLX-integrated path.
 
-**Apple M5 introduced cooperative_tensor INT8 TensorOps (matmul2d 16×32×16), delivering 2× the TOPS of FP16 — but no ML framework on macOS uses them.** MLX's quantization path is W4A16: it compresses weights to save memory, but computation still runs in FP16. This means prefill (the compute-bound phase of LLM inference) gets zero benefit from INT8 hardware. W8A8 is the only quantization scheme that accelerates both compute and memory: activations and weights are both INT8, so the matmul runs on the faster INT8 datapath. Cider provides the missing pipeline — online activation quantization, INT8 TensorOps matmul, and fused dequantization — to unlock this dormant hardware capability. End-to-end prefill speedup: **1.15–1.21× over W8A16** on Qwen3-VL-2B (M5 Pro), with negligible accuracy loss (PPL Δ < 0.01 on Llama-3-8B).
+**Apple M5 introduced cooperative_tensor INT8 TensorOps (matmul2d 16×32×16), delivering 2× the TOPS of FP16 — but no ML framework on macOS uses them.** In the MLX quantization path we examined (v0.31), quantized weights are dequantized for computation and the corresponding matmul path remains FP16-based rather than end-to-end INT8. This means prefill (the compute-bound phase of LLM inference) gets zero benefit from INT8 hardware. W8A8 is the only quantization scheme that accelerates both compute and memory: activations and weights are both INT8, so the matmul runs on the faster INT8 datapath. Cider provides the missing pipeline — online activation quantization, INT8 TensorOps matmul, and fused dequantization — to unlock this dormant hardware capability. In our current experiments on Qwen3-VL-2B (M5 Pro), Cider achieves 1.15–1.21× prefill speedup over a W8A16 baseline, while preserving comparable language-model perplexity in our Llama-3-8B check (PPL Δ < 0.01).
+
 
 ## Background: What MLX Does Today
 
-MLX (as of v0.31) uses INT8 TensorOps **nowhere** in its codebase:
+In the MLX v0.31 code paths we examined, we did not find a public end-to-end INT8 TensorOps inference path.
+
+More specifically:
 
 - **Standard matmul** (`steel_gemm_fused_nax.metal`): Instantiated for `float16`, `bfloat16`, `float32` only. No `int8` instantiation exists.
 - **Quantized matmul** (`quantized_nax.h`): Dequantizes packed int{2,3,4,5,6,8} weights → FP16, then uses **FP16 TensorOps**. This is weight-only quantization — activations stay in FP16.
 
-MLX *could* instantiate `int8` GEMM — the templates are generic. They simply choose not to, because a raw INT8 matmul alone isn't useful without the surrounding quantize/dequant pipeline.
+This does **not** mean INT8 TensorOps are impossible in MLX. At the shader level, the underlying GEMM template structure appears flexible enough to support INT8 instantiations. The missing piece is a complete and exposed W8A8 execution pipeline.
+
 
 ## The Benchmark
 
@@ -54,47 +58,46 @@ Where:
 - **Cider Raw INT8** = `int8_matmul_int32()`: Pure INT8×INT8→INT32 (no quantize, no dequant)
 - **MLX-style INT8** = Standalone NAX kernel via `mx.fast.metal_kernel`: Same pure INT8→INT32
 
-## What the Numbers Tell Us
+## What the Numbers Suggest
 
-### 1. Raw INT8 matmul throughput is equivalent
+### 1. Raw INT8 TensorOps throughput is comparable
 
-Across all tested sizes, Cider Raw and MLX-style differ by **≤ 8%** — well within dispatch and scheduling variance. Both execute the same `matmul2d(16, 32, 16)` TensorOps instruction with the same tile configuration. The hardware doesn't care who wrote the kernel.
+Across the tested shapes, Cider Raw INT8 and the standalone MLX-style INT8 kernel deliver similar throughput. This is consistent with the fact that both rely on the same underlying `matmul2d` TensorOps instruction with similar tile configurations.
 
-At small M (≤ 64), Cider is slightly faster thanks to its dedicated small-tile kernel (BM=32, 128 threads) vs the MLX-style kernel's fixed BM=128 config.
 
-### 2. The full pipeline costs 1–12% over raw matmul
 
-Cider Full includes two extra operations that raw matmul doesn't:
-- **Per-token INT8 quantization**: FP16 activations → INT8 + per-token scale (separate kernel)
-- **Fused dequantization**: INT32 accumulator × scale_act × scale_weight → FP16 (fused in matmul store)
+### 2. The main cost of a usable W8A8 path is pipeline integration
 
-At M=2048, this overhead is 8% (1.68ms vs 1.55ms). At small M, the quantize kernel's fixed overhead dominates and the ratio approaches 1.0x (the matmul itself is so fast that quantize cost is negligible). This overhead is inherent to **any** W8A8 implementation — you cannot skip quantization or dequantization.
+Compared with raw INT8 matmul, the full Cider path additionally includes:
+- activation quantization,
+- scale handling,
+- and dequantization back to the desired output dtype.
 
-## Why Cider Implements Its Own Kernel
+These steps introduce overhead, but they are also what make W8A8 usable in practice.
 
-Given that MLX's templates could produce an identical INT8 matmul, why does Cider write its own?
+### 3. Cider's main value is exposing an end-to-end W8A8 path
+Our results suggest that the key contribution of Cider is not a claim of unique raw GEMM throughput, but the availability of an integrated W8A8 execution path on Apple Silicon.
 
-### 1. Fused dequantization in the store phase
 
-MLX's NAX GEMM store writes raw typed output (`static_cast<OutType>(acc)`). W8A8 inference requires:
+## Why Cider Uses a Custom Kernel Path
 
-```
-C_fp16[i][j] = C_int32[i][j] * scale_act[i] * scale_weight[j]
-```
+If a standalone MLX-style INT8 kernel can achieve similar raw throughput, why does Cider still implement its own kernel path?
 
-Cider fuses this multiplication into the store phase of the matmul kernel. Without fusion, you'd need a separate elementwise kernel — adding one extra device memory round-trip (~0.1–0.2ms at M=2048).
 
-### 2. Quantize + matmul in one command encoder
+### 1. To support dequantization as part of the usable W8A8 path
 
-Cider packages activation quantization (FP16→INT8) and the INT8 matmul as a single MLX primitive. One C++ `eval()` call dispatches both Metal kernels in the same command encoder. Using MLX's standard matmul op for INT8 would require two separate graph nodes with potential scheduling gaps.
+A practical W8A8 inference path needs more than raw INT32 accumulation. It also needs output scaling and dtype conversion in a form that fits the surrounding runtime.
 
-### 3. MLX's matmul dispatch doesn't support INT8
 
-`mlx/backend/common/compiled.cpp` and `Matmul.cpp` dtype switches only handle floating-point types. Even if you instantiated the INT8 GEMM Metal shader, MLX's C++ `matmul()` op wouldn't route to it. You'd need either:
-- Modifying MLX source (impractical for users)
-- Using `mx.fast.metal_kernel` (works, but adds Python dispatch overhead and loses graph fusion)
+### 2. To keep quantization and INT8 matmul in one integrated execution path
 
-Cider solves this by implementing INT8 matmul as a custom primitive (`mlx::core::Primitive` subclass), bypassing MLX's type restrictions while still integrating with its lazy evaluation graph.
+Cider packages activation quantization and INT8 matmul into a custom MLX primitive, which is more practical than treating them as disconnected experimental kernels.
+
+
+### 3. To bypass the current lack of a public end-to-end INT8 route in standard MLX dispatch
+
+Even if INT8 kernels are possible at the shader level, they are not currently exposed as a standard end-to-end W8A8 inference path in the MLX stack we examined.
+
 
 ## Reproducing
 
@@ -106,3 +109,9 @@ python benchmarks/mlx_native/bench_cider_vs_mlx_int8.py
 Requires: Apple M5+, MLX ≥ 0.31, Cider installed.
 
 The MLX-style kernel is compiled at runtime via `mx.fast.metal_kernel` with Metal 4 + MPP headers. No Xcode installation required.
+
+## Notes
+
+- All statements in this document are scoped to the MLX version and code paths we examined during this comparison.
+- The standalone MLX-style INT8 kernel is a raw-kernel benchmark, not a full MLX-native end-to-end W8A8 inference pipeline.
+- Cider Full Pipeline results include activation quantization and output dequantization overhead, while raw INT8 kernel results do not.
