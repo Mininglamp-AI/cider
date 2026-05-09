@@ -59,44 +59,59 @@ def _should_build_ext() -> bool:
 class CMakeBuild(build_ext):
     def build_extension(self, ext):
         src_dir = Path(__file__).parent.resolve()
-        build_dir = src_dir / "build"
-        build_dir.mkdir(exist_ok=True)
+
+        # Resolve paths that cmake can't find in pip's isolated build env
+        import sysconfig
+        python_include = sysconfig.get_path("include")
+
+        try:
+            import nanobind
+            nanobind_dir = nanobind.cmake_dir()
+        except ImportError:
+            nanobind_dir = ""
 
         cmake_args = [
             f"-DPython_EXECUTABLE={sys.executable}",
+            f"-DPython_INCLUDE_DIR={python_include}",
             "-DCMAKE_BUILD_TYPE=Release",
         ]
+        if nanobind_dir:
+            cmake_args.append(f"-Dnanobind_DIR={nanobind_dir}")
+
         build_args = ["--config", "Release", "-j"]
 
+        # In-source build (cmake outputs .so to src_dir)
         subprocess.check_call(
-            ["cmake", str(src_dir)] + cmake_args,
-            cwd=build_dir,
+            ["cmake", "."] + cmake_args,
+            cwd=src_dir,
         )
         subprocess.check_call(
             ["cmake", "--build", "."] + build_args,
-            cwd=build_dir,
+            cwd=src_dir,
         )
 
         import shutil
 
-        # Determine the output directory setuptools will package into the wheel.
-        # For `pip install .` this is a temp build tree; for `-e .` it is the
-        # source tree itself — both cases are handled correctly.
-        output_lib_dir = Path(self.build_lib) / "cider" / "lib"
+        # Copy .so to build_lib root (where setuptools expects the extension)
+        build_lib = Path(self.build_lib)
+        build_lib.mkdir(parents=True, exist_ok=True)
+        for f in src_dir.glob("_cider_prim*.so"):
+            shutil.copy2(f, build_lib)
+
+        # Also copy to cider/lib/ for runtime loading
+        output_lib_dir = build_lib / "cider" / "lib"
         output_lib_dir.mkdir(parents=True, exist_ok=True)
-
-        # Copy all .so and .dylib into cider/lib/ inside the build tree
-        for f in build_dir.glob("*.so"):
+        for f in src_dir.glob("*.so"):
             shutil.copy2(f, output_lib_dir)
-        for f in build_dir.glob("*.dylib"):
+        for f in src_dir.glob("*.dylib"):
             shutil.copy2(f, output_lib_dir)
 
-        # Also write to source tree cider/lib/ so editable installs work
+        # Write to source tree cider/lib/ so editable installs work
         src_lib_dir = src_dir / "cider" / "lib"
         src_lib_dir.mkdir(exist_ok=True)
-        for f in build_dir.glob("*.so"):
+        for f in src_dir.glob("*.so"):
             shutil.copy2(f, src_lib_dir)
-        for f in build_dir.glob("*.dylib"):
+        for f in src_dir.glob("*.dylib"):
             shutil.copy2(f, src_lib_dir)
 
 
