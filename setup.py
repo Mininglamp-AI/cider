@@ -60,9 +60,7 @@ class CMakeBuild(build_ext):
     def build_extension(self, ext):
         src_dir = Path(__file__).parent.resolve()
         build_dir = src_dir / "build"
-        lib_dir = src_dir / "cider" / "lib"
         build_dir.mkdir(exist_ok=True)
-        lib_dir.mkdir(exist_ok=True)
 
         cmake_args = [
             f"-DPython_EXECUTABLE={sys.executable}",
@@ -79,19 +77,27 @@ class CMakeBuild(build_ext):
             cwd=build_dir,
         )
 
-        # Copy artifacts to cider/lib/
         import shutil
-        for f in build_dir.glob("*.so"):
-            shutil.copy2(f, lib_dir)
-        for f in build_dir.glob("*.dylib"):
-            shutil.copy2(f, lib_dir)
 
-        # Also copy .so to where setuptools expects it (for pip install -e .)
-        ext_dest = self.get_ext_fullpath(ext.name)
-        os.makedirs(os.path.dirname(ext_dest), exist_ok=True)
-        so_files = list(build_dir.glob("_cider_prim*.so"))
-        if so_files:
-            shutil.copy2(so_files[0], ext_dest)
+        # Determine the output directory setuptools will package into the wheel.
+        # For `pip install .` this is a temp build tree; for `-e .` it is the
+        # source tree itself — both cases are handled correctly.
+        output_lib_dir = Path(self.build_lib) / "cider" / "lib"
+        output_lib_dir.mkdir(parents=True, exist_ok=True)
+
+        # Copy all .so and .dylib into cider/lib/ inside the build tree
+        for f in build_dir.glob("*.so"):
+            shutil.copy2(f, output_lib_dir)
+        for f in build_dir.glob("*.dylib"):
+            shutil.copy2(f, output_lib_dir)
+
+        # Also write to source tree cider/lib/ so editable installs work
+        src_lib_dir = src_dir / "cider" / "lib"
+        src_lib_dir.mkdir(exist_ok=True)
+        for f in build_dir.glob("*.so"):
+            shutil.copy2(f, src_lib_dir)
+        for f in build_dir.glob("*.dylib"):
+            shutil.copy2(f, src_lib_dir)
 
 
 if _should_build_ext():
