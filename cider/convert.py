@@ -25,31 +25,32 @@ from .nn import CiderLinear
 _TARGET_TYPES = (nn.Linear, nn.QuantizedLinear)
 
 
-def _convert_children(module, counter):
+def _convert_children(module, counter, clip_percentile=None):
     """Walk module.children(), replace Linear/QuantizedLinear in-place."""
     for name, child in module.children().items():
         if isinstance(child, _TARGET_TYPES):
-            setattr(module, name, CiderLinear.from_float(child))
+            setattr(module, name, CiderLinear.from_float(child, clip_percentile=clip_percentile))
             counter[0] += 1
             if counter[0] % 28 == 0:
                 gc.collect()
         elif isinstance(child, list):
             for i, item in enumerate(child):
                 if isinstance(item, _TARGET_TYPES):
-                    child[i] = CiderLinear.from_float(item)
+                    child[i] = CiderLinear.from_float(item, clip_percentile=clip_percentile)
                     counter[0] += 1
                     if counter[0] % 28 == 0:
                         gc.collect()
                 elif isinstance(item, nn.Module):
-                    _convert_children(item, counter)
+                    _convert_children(item, counter, clip_percentile=clip_percentile)
         elif isinstance(child, nn.Module):
-            _convert_children(child, counter)
+            _convert_children(child, counter, clip_percentile=clip_percentile)
         # Skip dict/other non-Module children (e.g. rope_scaling)
 
 
 def convert_model(
     model: nn.Module,
     *,
+    clip_percentile: float = None,
     verbose: bool = True,
 ) -> dict:
     """Convert all Linear/QuantizedLinear layers to CiderLinear (in-place).
@@ -84,7 +85,7 @@ def convert_model(
 
     t0 = time.perf_counter()
     counter = [0]
-    _convert_children(model, counter)
+    _convert_children(model, counter, clip_percentile=clip_percentile)
 
     elapsed = time.perf_counter() - t0
     n = counter[0]

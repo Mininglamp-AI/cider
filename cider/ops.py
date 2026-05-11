@@ -72,20 +72,31 @@ def is_available() -> bool:
 
 def quantize_weight_int8(
     w: np.ndarray,
+    clip_percentile: float = None,
 ) -> tuple:
     """Quantize FP16/FP32 weights to per-row symmetric INT8.
 
     Args:
         w: Weight matrix [N, K] as numpy array (N=out_features, K=in_features).
+        clip_percentile: If set (e.g. 99.9), use per-row percentile instead of
+            absmax to compute scale. Clips outliers before quantization, improving
+            precision for layers with extreme weight outliers. Default None (absmax).
 
     Returns:
         (w_int8, scale_w) where w_int8 is [N, K] int8 and
         scale_w is [N] float32 (one scale per output channel).
     """
     w = w.astype(np.float32)
-    row_max = np.max(np.abs(w), axis=1)  # [N]
-    scale = row_max / 127.0
-    scale = np.where(scale == 0, 1.0, scale)
+    if clip_percentile is not None:
+        row_clip = np.percentile(np.abs(w), clip_percentile, axis=1)  # [N]
+        row_clip = np.where(row_clip == 0, np.max(np.abs(w), axis=1), row_clip)
+        scale = row_clip / 127.0
+        scale = np.where(scale == 0, 1.0, scale)
+        w = np.clip(w, -row_clip[:, np.newaxis], row_clip[:, np.newaxis])
+    else:
+        row_max = np.max(np.abs(w), axis=1)  # [N]
+        scale = row_max / 127.0
+        scale = np.where(scale == 0, 1.0, scale)
     w_int8 = np.clip(np.round(w / scale[:, np.newaxis]), -128, 127).astype(np.int8)
     return w_int8, scale.astype(np.float32)
 

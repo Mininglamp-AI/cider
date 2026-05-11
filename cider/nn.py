@@ -113,7 +113,7 @@ class CiderLinear(nn.Module):
         return y
 
     @staticmethod
-    def from_float(layer: nn.Module, target_group_size: int = None) -> "CiderLinear":
+    def from_float(layer: nn.Module, target_group_size: int = None, clip_percentile: float = None) -> "CiderLinear":
         """Create from nn.Linear or nn.QuantizedLinear.
 
         For QuantizedLinear (8-bit, gs∈{64,128,256}): dequant → symmetric requant per-group.
@@ -149,7 +149,7 @@ class CiderLinear(nn.Module):
 
             if tgs == 0:
                 # Per-channel symmetric requant
-                w_int8_np, scale_np = ops.quantize_weight_int8(w_np)
+                w_int8_np, scale_np = ops.quantize_weight_int8(w_np, clip_percentile=clip_percentile)
                 return CiderLinear(
                     w_int8=mx.array(w_int8_np),
                     scale_w=mx.array(scale_np),
@@ -178,7 +178,7 @@ class CiderLinear(nn.Module):
             w_np = np.array(layer.weight.astype(mx.float32))
 
             if tgs == 0:
-                w_int8_np, scale_np = ops.quantize_weight_int8(w_np)
+                w_int8_np, scale_np = ops.quantize_weight_int8(w_np, clip_percentile=clip_percentile)
             else:
                 w_int8_np, scale_np = _symmetric_quantize_pergroup(w_np, tgs)
 

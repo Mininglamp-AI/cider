@@ -166,7 +166,12 @@ Shape [N=2560, K=10240]
   </tbody>
 </table>
 
+## NOTE
+It's important to note that cider assumes the weights are <span style="color: red;">**quantization-friendly**</span> . This means you need to ensure your model has already undergone some post-training quantization calibration methods, such as GTPQ, SmoothQuant, or Quarot etc, to handle outliers or the model itself was trained using QAT. When cider transforms the model (e.g., with w8a8) and calculates the quantization scale, it defaults to the simplest **min-max** method, although it also supports the 99th percentile method (clip_percentile=99.9). If you encounter garbled output, it's highly likely that your model is affected by <span style="color: red;">**outliers**</span> . Therefore, some preprocessing is **necessary**.
+
+
 ## Requirements
+
 
 - **Apple M5+** for INT8 TensorOps (M4 and below: installs as pure-Python, `is_available()` returns False)
 - Python 3.12+
