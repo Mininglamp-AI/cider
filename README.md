@@ -1,6 +1,11 @@
 # cider
 
-Cider is developed on top of MLX for macOS. It provides online activation quantization operators absent in MLX, with custom int-matmul kernels built as MLX custom primitives supporting full lazy evaluation. It also includes service-side extensions and non-intrusive compatibility patches for mlx_vlm (validated on mlx_vlm 0.4.3), including fixes for Qwen3-VL multi-image inference issues related to RoPE position handling and chunked prefill. 
+Cider is developed on top of MLX for macOS. It provides:
+
+1. **Online activation quantization** (W8A8/W4A8) absent in MLX, with custom INT8 TensorOps kernels built as MLX custom primitives supporting full lazy evaluation.
+2. **Optimized SDPA decode kernel** inspired by [FlashInfer](https://github.com/flashinfer-ai/flashinfer), featuring contiguous chunk GQA scheduling and register tiling for faster autoregressive decode.
+
+It also includes service-side extensions and non-intrusive compatibility patches for mlx_vlm (validated on mlx_vlm 0.4.3), including fixes for Qwen3-VL multi-image inference issues related to RoPE position handling and chunked prefill. 
 
 ## Conditional Compilation (M4 / M5)
 
@@ -27,6 +32,61 @@ CIDER_FORCE_BUILD=0 pip install -e .   # Force skip
 | W8A16 | — | — | MLX built-in | Baseline |
 
 **W4A16 and W8A16 are already supported by MLX natively** — this SDK provides the missing W8A8 and W4A8 modes that MLX does not implement.
+
+## Optimized SDPA (Decode Attention)
+
+Cider includes an optimized **Scaled Dot-Product Attention** kernel for autoregressive decode (`Q_seq=1`), inspired by [FlashInfer](https://github.com/flashinfer-ai/flashinfer). Key techniques:
+
+- **Contiguous Chunk GQA Scheduling**: Instead of dispatching each Q head independently (reading KV `H_q` times), a single threadgroup processes all Q heads sharing the same KV group. This reduces DRAM bandwidth by up to `gqa_factor`×.
+- **Register Tiling (TILE=4)**: Each thread holds partial results for 4 Q heads in registers — no shared memory, no barrier synchronization — maximizing ALU throughput for grouped-query decode.
+- **2-Pass FlashDecoding**: For long sequences (≥1024 tokens), a 2-pass reduction partitions the KV sequence across threadgroups to improve occupancy.
+- **AutoTune**: Automatic sweep of block sizes per (architecture, GQA ratio, head count, sequence length), cached to `~/.cider_sdpa_tune.json`.
+
+### Usage
+
+```python
+import cider
+
+# One-line patch — all downstream frameworks (mlx_lm, mlx_vlm) benefit automatically
+cider.patch_sdpa()
+
+# Optional: run AutoTune once to find optimal block sizes for your chip
+cider.autotune_sdpa()
+
+# Undo patch if needed
+cider.unpatch_sdpa()
+```
+
+The patch is **fully transparent**: prefill (`Q_seq > 1`) and masked attention automatically fall back to MLX's native implementation. Only decode steps (`Q_seq=1`, no mask) route through Cider's optimized kernel. **Zero code changes** to mlx_lm or mlx_vlm.
+
+### SDPA Micro-Benchmark (Apple M5 Pro, D=128)
+
+Speedup vs MLX `mx.fast.scaled_dot_product_attention`:
+
+| Config | N=1K | N=2K | N=4K | N=8K | N=16K | N=32K |
+|--------|------|------|------|------|-------|-------|
+| MHA (H_q=32, H_kv=32) | 1.03x | 1.01x | 1.02x | 1.00x | 1.00x | 0.99x |
+| GQA4 (H_q=32, H_kv=8) | 1.04x | 1.06x | 1.06x | 1.12x | 1.16x | 1.21x |
+| GQA8 (H_q=32, H_kv=4) | 1.04x | 1.07x | 1.13x | 1.21x | 1.34x | **1.57x** |
+
+Speedup range: **0.99×–1.57×**. Correctness: 18/18 PASS (max diff ≤ 0.000122 vs MLX, fp16). 14 WIN / 4 TIE / 0 LOSS — zero regressions.
+
+### End-to-End Decode Speed with SDPA (Qwen3-VL-4B, Apple M5 Pro)
+
+Tested with `benchmarks/bench_e2e_wxa16.py` on real multi-image VLM trajectories (1–3 screenshots, 1334–3455 prompt tokens):
+
+| Config | Decode tok/s | vs Baseline |
+|--------|:-----------:|:-----------:|
+| FP16 | 32.0 | — |
+| FP16 + Cider SDPA | 32.6 | +1.9% |
+| W8A16 | 54.0 | — |
+| W8A16 + Cider SDPA | **58.0** | **+7.4%** |
+| W8A8 per-group | 51.0 | — |
+| W8A8 per-group + Cider SDPA | 52.3 | +2.5% |
+| W8A8 per-channel | 49.1 | — |
+| W8A8 per-channel + Cider SDPA | **52.6** | **+7.1%** |
+
+Cider SDPA stacks on top of W8A8 prefill gains. The benefit scales with GQA ratio and KV cache length — models with higher GQA ratios (e.g., Qwen3-32B with GQA8) and longer contexts see larger gains.
 
 MLX's quantization is **weight-only**: QuantizedLinear dequantizes weights to FP16 and uses FP16 GEMM. While MLX's Steel NAX templates are generic enough to be instantiated with INT8 types (and would achieve identical raw matmul throughput — [see our transparent benchmark](benchmarks/mlx_native/cider_vs_mlx_int8.md)), MLX does not provide the quantization/dequantization pipeline needed for actual W8A8 inference. Cider fills this gap with fused quantize-matmul-dequant primitives.
 
@@ -264,25 +324,33 @@ cider/
 │   ├── ops.py             # Primitive wrappers + quantize helpers
 │   ├── nn.py              # CiderLinear, W4A8Linear (nn.Module)
 │   ├── convert.py         # convert_model() high-level API
+│   ├── attention/         # Optimized SDPA
+│   │   ├── __init__.py
+│   │   └── sdpa.py           # patch_sdpa / unpatch_sdpa / autotune_sdpa
 │   └── kernels/           # Metal shaders (bundled)
 │       ├── w8a8_matmul.metal       # W8A8 GEMM (prefill, M>1)
 │       ├── w8a8_int8_mv.metal      # W8A8 per-channel MV (decode, M=1)
 │       ├── w8a8_quantize.metal     # Per-token activation quantization
 │       ├── w4a8_matmul.metal       # W4A8 GEMM (prefill)
 │       ├── pergroup_int8_gemm.metal # Per-group GEMM (prefill)
-│       └── pergroup_int8_mv.metal   # Per-group MV (decode)
+│       ├── pergroup_int8_mv.metal   # Per-group MV (decode)
+│       ├── cider_sdpa_vector.h     # SDPA kernel header (1-pass & 2-pass)
+│       └── cider_sdpa_vector.metal # SDPA kernel template instantiations
 ├── csrc/                  # C++ MLX primitives (nanobind, M5+ only)
 │   ├── include/
 │   │   ├── w8a8_primitive.h
 │   │   ├── w4a8_primitive.h
-│   │   └── pergroup_primitive.h
+│   │   ├── pergroup_primitive.h
+│   │   └── sdpa_primitive.h
 │   └── src/
 │       ├── w8a8_primitive.mm
 │       ├── w4a8_primitive.mm
 │       ├── pergroup_primitive.mm
+│       ├── sdpa_primitive.mm      # SDPA 1-pass & 2-pass primitives
 │       └── prim_bindings.cpp
 ├── benchmarks/
-│   ├── bench_e2e_wxa16.py    # End-to-end VLM benchmark (Qwen3-VL-2B)
+│   ├── bench_e2e_wxa16.py    # End-to-end VLM benchmark (W8A8 + SDPA)
+│   ├── bench_sdpa.py         # SDPA micro-benchmark (correctness + speed vs MLX)
 │   ├── bench_full.py         # Isolated kernel latency (per-channel/per-group vs MLX)
 │   ├── test_bitexact.py      # Numerical correctness verification
 │   └── mlx_native/           # MLX native INT8 comparison
@@ -497,6 +565,9 @@ python tools/eval_ppl_all.py --num-samples 50
 - [x] Dedicated decode MV kernel (matches native MLX speed)
 - [x] Conditional compilation (M4 graceful fallback)
 - [x] mlx_vlm and mlx_lm integration examples
+- [x] Optimized SDPA decode kernel (FlashInfer-inspired, GQA-aware)
+- [x] One-line `patch_sdpa()` for transparent decode acceleration
+- [x] SDPA AutoTune (per-architecture block size sweep)
 - [ ] ANE primitives lazy evaluation
 - [ ] Integrated Pruning Feature
 - [ ] KVCache quantization
@@ -529,5 +600,6 @@ MIT
 ## Acknowledgments
 
 - [MLX](https://github.com/ml-explore/mlx) by Apple — primitive API, NAXFrag kernel architecture
+- [FlashInfer](https://github.com/flashinfer-ai/flashinfer) — inspired contiguous chunk GQA scheduling and register tiling for SDPA decode kernel
 - Metal 4 MetalPerformancePrimitives for INT8 TensorOps
 - [maderix/ANE](https://github.com/maderix/ANE) — inspired and informed our ANE+GPU tensor-parallel implementation
