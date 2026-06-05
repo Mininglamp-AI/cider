@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cider"
-version = "0.7.0"
-description = "INT8 TensorOps quantized matmul for Apple M5+ (W8A8, W4A8)"
+version = "0.8.0"
+description = "INT8 TensorOps quantized matmul + optimized SDPA for Apple M5+ (W8A8, W4A8)"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
@@ -33,7 +33,7 @@ Homepage = "https://github.com/Mininglamp-AI/cider"
 include = ["cider*", "vlm_service*"]
 
 [tool.setuptools.package-data]
-"cider" = ["kernels/*.metal", "lib/*.so", "lib/*.dylib"]
+"cider" = ["kernels/*.metal", "kernels/*.h", "lib/*.so", "lib/*.dylib"]
 
 [project.optional-dependencies]
 serve = ["fastapi", "uvicorn", "pyyaml"]

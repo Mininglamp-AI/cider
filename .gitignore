@@ -8,6 +8,8 @@ dist/
 __pycache__/
 *.pyc
 *.pyo
+*.a
+deprecated
 
 # C++ / CMake
 CMakeCache.txt

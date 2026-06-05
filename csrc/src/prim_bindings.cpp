@@ -5,6 +5,7 @@
 
 #include "mlx/ops.h"
 #include "pergroup_primitive.h"
+#include "sdpa_primitive.h"
 #include "w4a8_primitive.h"
 #include "w8a8_primitive.h"
 
@@ -13,7 +14,7 @@ using namespace nb::literals;
 namespace mx = mlx::core;
 
 NB_MODULE(_cider_prim, m) {
-  m.doc() = "cider: W8A8 + W4A8 INT8 TensorOps primitives for Apple M5 and M5+";
+  m.doc() = "cider: W8A8 + W4A8 INT8 TensorOps + SDPA primitives for Apple M5+";
 
   m.def("perchannel_linear", &cider::perchannel_linear, "x"_a, "w"_a, "scale_w"_a,
         "bias"_a, "kernel_dir"_a, nb::kw_only(), "stream"_a = nb::none(),
@@ -32,4 +33,17 @@ NB_MODULE(_cider_prim, m) {
         "stream"_a = nb::none(),
         "Per-group INT8 linear with bias: prefill GEMM or decode MV with "
         "per-group scales");
+
+  // ── SDPA ──
+  m.def("cider_sdpa_1pass", &cider::cider_sdpa_1pass,
+        "queries"_a, "keys"_a, "values"_a,
+        "gqa_factor"_a, "scale"_a, "kernel_dir"_a,
+        nb::kw_only(), "stream"_a = nb::none(),
+        "Cider v9 SDPA 1-pass (short sequences)");
+
+  m.def("cider_sdpa_2pass", &cider::cider_sdpa_2pass,
+        "queries"_a, "keys"_a, "values"_a,
+        "gqa_factor"_a, "blocks"_a, "scale"_a, "kernel_dir"_a,
+        nb::kw_only(), "stream"_a = nb::none(),
+        "Cider v9 SDPA 2-pass with contiguous chunks + TILE=4 tiling");
 }

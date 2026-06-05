@@ -3,7 +3,9 @@
 End-to-end benchmark on REAL trajectory data:
   1. GPU FP16 baseline
   2. GPU W8A16 (native quantized_matmul)
-  3. GPU W8A8 (INT8 TensorOps via cider, auto prefill/decode)
+  3. GPU W8A8_pg (INT8 TensorOps via cider, pergroup)
+  4. GPU W8A8_pc (INT8 TensorOps via cider, perchannel)
+  5-8. Above 4 configs + Cider SDPA patch (decode acceleration)
 
 Uses replay_prompt.build_prompt_at_step() to build real prompts with real screenshots.
 Compares both accuracy (action output) and speed (prefill + decode).
@@ -28,7 +30,7 @@ SESSION_DIR = os.path.join(ROOT_DIR, "session_data")
 STEPS       = [0, 1, 2]  # step 0: 1img, step 1: 2imgs, step 2: 3imgs
 MAX_TOKENS  = 200
 PREFILL_STEP = 8192
-N_SPEED_RUNS = 2  # per-step speed runs (fewer since we have multiple steps)
+N_SPEED_RUNS = 2  # per-step speed runs
 
 
 def load_step(session_dir, step):
@@ -58,11 +60,7 @@ def build_messages(data):
 
 
 def run_generate(model, processor, messages, pil_images):
-    """Run one generation, return (text, timing_dict).
-
-    CiderLinear auto-detects prefill (seq>1) vs decode (seq==1).
-    No manual mode switching needed.
-    """
+    """Run one generation, return (text, timing_dict)."""
     prompt = processor.tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
@@ -77,20 +75,24 @@ def run_generate(model, processor, messages, pil_images):
     prompt_tokens = 0
     gen_tokens = 0
 
-    for resp in custom_stream_generate(
-        model, processor,
-        prompt=prompt,
-        image=pil_images,
-        max_tokens=MAX_TOKENS,
-        temperature=0.0,
-        prefill_step_size=PREFILL_STEP,
-        verbose=False,
-    ):
-        text += resp.text
-        prefill_time = resp.prompt_tokens / resp.prompt_tps if resp.prompt_tps > 0 else 0
-        decode_tps = resp.generation_tps
-        prompt_tokens = resp.prompt_tokens
-        gen_tokens = resp.generation_tokens
+    try:
+        for resp in custom_stream_generate(
+            model, processor,
+            prompt=prompt,
+            image=pil_images,
+            max_tokens=MAX_TOKENS,
+            temperature=0.0,
+            prefill_step_size=PREFILL_STEP,
+            verbose=False,
+        ):
+            text += resp.text
+            prefill_time = resp.prompt_tokens / resp.prompt_tps if resp.prompt_tps > 0 else 0
+            decode_tps = resp.generation_tps
+            prompt_tokens = resp.prompt_tokens
+            gen_tokens = resp.generation_tokens
+    except UnicodeDecodeError:
+        # mlx_vlm detokenizer sometimes fails on partial utf-8 sequences
+        pass
 
     total_time = prefill_time + (gen_tokens / decode_tps if decode_tps > 0 else 0)
 
@@ -121,10 +123,9 @@ def extract_coords(action_str):
 
 
 def main():
-    print("=" * 70)
-    print("  E2E Benchmark on Real Trajectory Data")
-    print("  FP16 GPU  vs  W8A16 GPU  vs  W8A8 GPU (auto prefill/decode)")
-    print("=" * 70)
+    print("=" * 80)
+    print("  E2E Benchmark: FP16 / W8A16 / W8A8 × MLX SDPA / Cider SDPA")
+    print("=" * 80)
     print(f"  Session: {SESSION_DIR}")
     print(f"  Steps: {STEPS}")
     print(f"  Max tokens: {MAX_TOKENS}")
@@ -139,30 +140,44 @@ def main():
         step_data[s] = (data, images, msgs)
         print(f"  Step {s}: {len(images)} images")
 
-    # configs: (key, model_path, use_cider, label)
+    # Import cider for SDPA patching
+    import cider
+
+    # configs: (key, model_path, use_cider_quant, use_cider_sdpa, label)
     configs = [
-        ('fp16',   FP16_MODEL,  False, "GPU FP16"),
-        ('w8a16',  W8A16_MODEL, False, "GPU W8A16"),
-        ("w8a8_pg", W8A16_MODEL, True, "GPU W8A8_pg"),
-        ('w8a8_pc',   FP16_MODEL, True,  "GPU W8A8_pc"),
+        # Without Cider SDPA (MLX default attention)
+        ('fp16',          FP16_MODEL,  False, False, "FP16"),
+        ('fp16+sdpa',     FP16_MODEL,  False, True,  "FP16+CiderSDPA"),
+        ('w8a16',         W8A16_MODEL, False, False, "W8A16"),
+        ('w8a16+sdpa',    W8A16_MODEL, False, True,  "W8A16+CiderSDPA"),
+        ('w8a8_pg',       W8A16_MODEL, True,  False, "W8A8_pg"),
+        ('w8a8_pg+sdpa',  W8A16_MODEL, True,  True,  "W8A8_pg+CiderSDPA"),
+        ('w8a8_pc',       FP16_MODEL,  True,  False, "W8A8_pc"),
+        ('w8a8_pc+sdpa',  FP16_MODEL,  True,  True,  "W8A8_pc+CiderSDPA"),
     ]
 
     all_results = {}
 
-    for cfg_key, model_path, use_cider, label in configs:
-        print(f"\n{'='*70}")
+    for cfg_key, model_path, use_cider_quant, use_cider_sdpa, label in configs:
+        print(f"\n{'='*80}")
         print(f"  {label}")
-        print(f"{'='*70}")
+        print(f"{'='*80}")
 
         # Load model
         print(f"  Loading {model_path}...")
         model, proc = vlm_load(model_path)
 
-        # Apply cider conversion if needed (auto prefill/decode)
-        if use_cider:
+        # Apply cider quantization if needed
+        if use_cider_quant:
             from cider import convert_model
             stats = convert_model(model)
-            print(f"  [cider] {stats}")
+            print(f"  [cider quant] {stats}")
+
+        # Apply cider SDPA if needed
+        if use_cider_sdpa:
+            cider.patch_sdpa(verbose=True)
+        else:
+            cider.unpatch_sdpa(verbose=False)
 
         cfg_results = {}
 
@@ -173,7 +188,8 @@ def main():
             # Warmup
             text, timing = run_generate(model, proc, msgs, images)
             print(f"    Warmup: {timing['prompt_tokens']} prompt tok, "
-                  f"prefill {timing['prefill_ms']:.0f}ms, "
+                  f"prefill {timing['prefill_ms']:.0f}ms "
+                  f"({timing['prefill_tps']:.0f} tok/s), "
                   f"decode {timing['decode_tps']:.1f} tok/s")
 
             # Accuracy run (use warmup result)
@@ -199,8 +215,6 @@ def main():
             }
 
             print(f"    Action: {action}")
-            if coords:
-                print(f"    Coords: {coords}")
 
         all_results[cfg_key] = cfg_results
 
@@ -209,115 +223,104 @@ def main():
         gc.collect()
         mx.clear_cache()
 
-    # ── Accuracy Summary ──
-    print(f"\n{'='*70}")
-    print(f"  ACCURACY COMPARISON")
-    print(f"{'='*70}")
-
-    cfg_keys = [c[0] for c in configs]
-    cfg_labels = {c[0]: c[3] for c in configs}
-
-    for s in STEPS:
-        print(f"\n  Step {s} (prompt={all_results[cfg_keys[0]][s]['prompt_tokens']} tok):")
-        for k in cfg_keys:
-            r = all_results[k][s]
-            print(f"    {cfg_labels[k]:15s}: {r['action'] or '(no action)'}")
-
-        # Pairwise coord comparison
-        for i in range(len(cfg_keys)):
-            for j in range(i+1, len(cfg_keys)):
-                k1, k2 = cfg_keys[i], cfg_keys[j]
-                c1 = all_results[k1][s]['coords']
-                c2 = all_results[k2][s]['coords']
-                a1 = all_results[k1][s]['action']
-                a2 = all_results[k2][s]['action']
-                if a1 == a2:
-                    tag = "✅ IDENTICAL"
-                elif c1 and c2:
-                    diff = (abs(c1[0]-c2[0]), abs(c1[1]-c2[1]))
-                    close = all(d <= 5 for d in diff)
-                    tag = f"{'✅' if close else '⚠️'} diff=({diff[0]},{diff[1]})"
-                else:
-                    tag = "⚠️ DIFFERENT"
-                print(f"      {cfg_labels[k1]} vs {cfg_labels[k2]}: {tag}")
+    # Ensure SDPA is unpatched after benchmark
+    cider.unpatch_sdpa(verbose=False)
 
     # ── Speed Summary ──
-    print(f"\n{'='*70}")
+    print(f"\n{'='*80}")
     print(f"  SPEED SUMMARY (median of {N_SPEED_RUNS} runs)")
-    print(f"{'='*70}")
+    print(f"{'='*80}")
 
-    header = f"  {'Step':>4s} {'PrTok':>5s}"
-    for k in cfg_keys:
-        header += f" | {cfg_labels[k]:>15s}"
-    print(header)
-    print(f"  {'─' * (12 + 18 * len(cfg_keys))}")
+    cfg_keys = [c[0] for c in configs]
+    cfg_labels = {c[0]: c[4] for c in configs}
 
-    total_by_cfg = {k: [] for k in cfg_keys}
-
+    # Table: per-step results
+    print(f"\n  {'Config':<22s}", end="")
     for s in STEPS:
-        line = f"  {s:>4d} {all_results[cfg_keys[0]][s]['prompt_tokens']:>5d}"
-        for k in cfg_keys:
-            ts = all_results[k][s]['timings']
-            med_total = float(np.median([t['total_ms'] for t in ts]))
-            total_by_cfg[k].append(med_total)
-            med_prefill = float(np.median([t['prefill_tps'] for t in ts]))
-            med_decode = float(np.median([t['decode_tps'] for t in ts]))
-            line += f" | {med_total:7.0f}ms {med_decode:5.1f}d"
-        print(line)
-
-    # Aggregate
-    print(f"\n  {'Aggregate':>10s}", end="")
-    for k in cfg_keys:
-        avg = np.mean(total_by_cfg[k])
-        print(f" | {cfg_labels[k]:>15s}: {avg:.0f}ms avg", end="")
+        print(f" | Step{s} prefill  decode  total", end="")
+    print()
+    print(f"  {'─'*22}", end="")
+    for _ in STEPS:
+        print(f" | {'─'*30}", end="")
     print()
 
-    # Speedup vs FP16
-    if 'fp16' in total_by_cfg:
-        fp16_avg = np.mean(total_by_cfg['fp16'])
-        print(f"\n  Speedup vs FP16:")
-        for k in cfg_keys:
-            if k == 'fp16':
-                continue
-            avg = np.mean(total_by_cfg[k])
-            print(f"    {cfg_labels[k]:15s}: {fp16_avg/avg:.2f}x overall")
-
-        print(f"\n  Per-step speedup vs FP16:")
+    for k in cfg_keys:
+        line = f"  {cfg_labels[k]:<22s}"
         for s in STEPS:
-            fp16_t = total_by_cfg['fp16'][STEPS.index(s)]
-            parts = [f"Step {s}:"]
-            for k in cfg_keys:
-                if k == 'fp16':
-                    continue
-                t = total_by_cfg[k][STEPS.index(s)]
-                parts.append(f"{cfg_labels[k]}={fp16_t/t:.2f}x")
-            print(f"    {' | '.join(parts)}")
+            ts = all_results[k][s]['timings']
+            pf = float(np.median([t['prefill_tps'] for t in ts]))
+            dc = float(np.median([t['decode_tps'] for t in ts]))
+            tt = float(np.median([t['total_ms'] for t in ts]))
+            line += f" | {pf:>7.0f}t/s {dc:>5.1f}t/s {tt:>5.0f}ms"
+        print(line)
 
-    # Speedup vs W8A16 (most relevant comparison for W8A8)
-    if 'w8a16' in total_by_cfg and 'w8a8' in total_by_cfg:
-        print(f"\n  Speedup W8A8 vs W8A16:")
+    # ── Decode speed comparison (SDPA impact) ──
+    print(f"\n{'='*80}")
+    print(f"  DECODE SPEED: MLX SDPA vs Cider SDPA")
+    print(f"{'='*80}")
+
+    # Group by base config
+    base_configs = ['fp16', 'w8a16', 'w8a8_pg', 'w8a8_pc']
+    for base in base_configs:
+        sdpa_key = base + '+sdpa'
+        if base not in all_results or sdpa_key not in all_results:
+            continue
+
+        print(f"\n  {cfg_labels[base]}:")
         for s in STEPS:
-            w8a16_t = total_by_cfg['w8a16'][STEPS.index(s)]
-            w8a8_t = total_by_cfg['w8a8'][STEPS.index(s)]
-            print(f"    Step {s}: {w8a16_t/w8a8_t:.2f}x")
-        w16_avg = np.mean(total_by_cfg['w8a16'])
-        w8_avg = np.mean(total_by_cfg['w8a8'])
-        print(f"    Overall: {w16_avg/w8_avg:.2f}x")
+            ts_base = all_results[base][s]['timings']
+            ts_sdpa = all_results[sdpa_key][s]['timings']
+            dc_base = float(np.median([t['decode_tps'] for t in ts_base]))
+            dc_sdpa = float(np.median([t['decode_tps'] for t in ts_sdpa]))
+            speedup = dc_sdpa / dc_base if dc_base > 0 else 0
+            pf_base = float(np.median([t['prefill_tps'] for t in ts_base]))
+            pf_sdpa = float(np.median([t['prefill_tps'] for t in ts_sdpa]))
+            print(f"    Step {s}: decode {dc_base:.1f} → {dc_sdpa:.1f} tok/s "
+                  f"({speedup:.2f}x) | prefill {pf_base:.0f} → {pf_sdpa:.0f} tok/s")
 
-    # Decode tok/s
-    print(f"\n  Decode tok/s (median across all steps):")
+    # ── Accuracy comparison ──
+    print(f"\n{'='*80}")
+    print(f"  ACCURACY: SDPA patch should not change outputs")
+    print(f"{'='*80}")
+
+    for base in base_configs:
+        sdpa_key = base + '+sdpa'
+        if base not in all_results or sdpa_key not in all_results:
+            continue
+        mismatches = 0
+        for s in STEPS:
+            a1 = all_results[base][s]['action']
+            a2 = all_results[sdpa_key][s]['action']
+            if a1 != a2:
+                mismatches += 1
+                c1 = all_results[base][s]['coords']
+                c2 = all_results[sdpa_key][s]['coords']
+                if c1 and c2:
+                    diff = (abs(c1[0]-c2[0]), abs(c1[1]-c2[1]))
+                    close = all(d <= 5 for d in diff)
+                    tag = f"{'≈' if close else '≠'} diff=({diff[0]},{diff[1]})"
+                else:
+                    tag = "≠"
+                print(f"  {cfg_labels[base]} Step {s}: {tag}")
+                print(f"    base: {a1}")
+                print(f"    sdpa: {a2}")
+        if mismatches == 0:
+            print(f"  {cfg_labels[base]}: all {len(STEPS)} steps IDENTICAL ✅")
+
+    # ── Overall Summary ──
+    print(f"\n{'='*80}")
+    print(f"  OVERALL DECODE tok/s (median across all steps)")
+    print(f"{'='*80}")
     for k in cfg_keys:
         all_decode = []
         for s in STEPS:
             ts = all_results[k][s]['timings']
             all_decode.append(float(np.median([t['decode_tps'] for t in ts])))
         med = np.median(all_decode)
-        print(f"    {cfg_labels[k]:15s}: {med:.1f} tok/s")
-
-    print(f"\n{'='*70}")
+        print(f"  {cfg_labels[k]:<22s}: {med:.1f} tok/s")
 
     # Save
-    out_path = '/tmp/e2e_wxa16_results.json'
+    out_path = '/tmp/e2e_wxa16_sdpa_results.json'
     save_data = {}
     for k in cfg_keys:
         save_data[k] = {}
@@ -336,7 +339,8 @@ def main():
             }
     with open(out_path, 'w') as f:
         json.dump(save_data, f, indent=2)
-    print(f"  Results saved to {out_path}")
+    print(f"\n  Results saved to {out_path}")
+    print(f"{'='*80}")
 
 
 if __name__ == '__main__':
